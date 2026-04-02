@@ -20,6 +20,7 @@
 #include "driver/spi_master.h"
 
 #define TAG "MovecallCuicanESP32S3"
+#define BOOT_TAG "BootButton"
 
 class NoBacklight : public Backlight {
 protected:
@@ -31,6 +32,8 @@ LV_FONT_DECLARE(font_awesome_16_4);
 
 class MovecallCuicanESP32S3 : public WifiBoard {
 private:
+    static constexpr uint16_t kBootShortPressTimeMs = 300;
+    static constexpr uint16_t kBootLongPressTimeMs = 1000;
     i2c_master_bus_handle_t codec_i2c_bus_;
     Button boot_button_;
     Display* display_;
@@ -95,11 +98,28 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            ESP_LOGI(BOOT_TAG, "Single click detected");
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiManager::GetInstance().IsConnected()) {
+            app.ToggleChatState();
+        });
+        boot_button_.OnDoubleClick([this]() {
+            auto state = Application::GetInstance().GetDeviceState();
+            ESP_LOGI(BOOT_TAG, "Double click detected, state=%d", state);
+            if (state == kDeviceStateIdle ||
+                state == kDeviceStateWifiConfiguring ||
+                state == kDeviceStateBleConfiguring) {
+                ESP_LOGI(BOOT_TAG, "Switching connectivity mode");
+                ToggleConnectivityMode();
+            }
+        });
+        boot_button_.OnLongPress([this]() {
+            ESP_LOGI(BOOT_TAG, "Long press detected, mode=%s",
+                ConnectivityModeToString(GetConnectivityMode()));
+            if (GetConnectivityMode() == ConnectivityMode::kBleRelay) {
+                ResetBleConfiguration();
+            } else {
                 ResetWifiConfiguration();
             }
-            app.ToggleChatState();
         });
     }
 
@@ -111,7 +131,7 @@ private:
     }
 
 public:
-    MovecallCuicanESP32S3() : boot_button_(BOOT_BUTTON_GPIO) {  
+    MovecallCuicanESP32S3() : boot_button_(BOOT_BUTTON_GPIO, false, kBootShortPressTimeMs, kBootLongPressTimeMs) {  
         InitializeCodecI2c();
         // InitializeSpi();
         // InitializeGc9a01Display();

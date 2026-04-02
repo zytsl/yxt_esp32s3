@@ -2,6 +2,7 @@
 #include "board.h"
 #include "system_info.h"
 #include "application.h"
+#include "settings.h"
 
 #include <cstring>
 #include <cJSON.h>
@@ -68,9 +69,24 @@ bool WebsocketProtocol::OpenAudioChannel() {
     busy_sending_audio_ = false;
     error_occurred_ = false;
     session_id_ = "";
-    std::string url = CONFIG_WEBSOCKET_URL;
-    std::string token = "Bearer " + std::string(CONFIG_WEBSOCKET_ACCESS_TOKEN);
-    websocket_ = Board::GetInstance().CreateWebSocket();
+    Settings settings("websocket", false);
+    std::string url = settings.GetString("url", CONFIG_WEBSOCKET_URL);
+    std::string access_token = settings.GetString("token", CONFIG_WEBSOCKET_ACCESS_TOKEN);
+    std::string token = "Bearer " + access_token;
+
+    const bool using_runtime_url = url != CONFIG_WEBSOCKET_URL;
+    const bool using_runtime_token = access_token != CONFIG_WEBSOCKET_ACCESS_TOKEN;
+    ESP_LOGI(TAG, "Using websocket config: url_source=%s token_source=%s url=%s",
+        using_runtime_url ? "ota" : "build",
+        using_runtime_token ? "ota" : "build",
+        url.c_str());
+
+    websocket_ = Board::GetInstance().CreateWebSocket(url);
+    if (websocket_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create websocket transport");
+        SetError(Lang::Strings::BLE_RELAY_ERROR);
+        return false;
+    }
     websocket_->SetHeader("Authorization", token.c_str());
     websocket_->SetHeader("Protocol-Version", "1");
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());

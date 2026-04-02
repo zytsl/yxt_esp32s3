@@ -1,5 +1,8 @@
 #include "wifi_board.h"
 
+#include "ble_relay_http.h"
+#include "ble_relay_manager.h"
+#include "ble_relay_transport.h"
 #include "display.h"
 #include "application.h"
 #include "system_info.h"
@@ -20,9 +23,17 @@
 #include <wifi_manager.h>
 #include <ssid_manager.h>
 #include <esp_sntp.h>
+#include <algorithm>
+#include <array>
 #include <time.h>
 
 static const char *TAG = "WifiBoard";
+
+namespace {
+constexpr const char* kConnectivityNamespace = "connectivity";
+constexpr const char* kPreferredModeKey = "preferred_mode";
+constexpr bool kForceBleDebugPairing = false;
+}
 
 WifiBoard::WifiBoard() {
     Settings settings("wifi", true);
@@ -30,6 +41,31 @@ WifiBoard::WifiBoard() {
     if (wifi_config_mode_) {
         ESP_LOGI(TAG, "force_ap is set to 1, reset to 0");
         settings.SetInt("force_ap", 0);
+    }
+
+    Settings connectivity_settings(kConnectivityNamespace, true);
+    if (kForceBleDebugPairing) {
+        connectivity_mode_ = ConnectivityMode::kBleRelay;
+        connectivity_settings.SetInt(kPreferredModeKey, static_cast<int32_t>(connectivity_mode_));
+        ESP_LOGW(TAG, "Force BLE debug pairing is enabled, overriding preferred mode to %s",
+            ConnectivityModeToString(connectivity_mode_));
+        return;
+    }
+
+    int preferred_mode = connectivity_settings.GetInt(kPreferredModeKey, -1);
+    if (preferred_mode < 0) {
+        connectivity_mode_ = SsidManager::GetInstance().GetSsidList().empty()
+            ? ConnectivityMode::kBleRelay
+            : ConnectivityMode::kWifiDirect;
+        connectivity_settings.SetInt(kPreferredModeKey, static_cast<int32_t>(connectivity_mode_));
+        ESP_LOGI(TAG, "No preferred connectivity mode in settings, defaulting to %s",
+            ConnectivityModeToString(connectivity_mode_));
+    } else {
+        connectivity_mode_ = preferred_mode == static_cast<int>(ConnectivityMode::kBleRelay)
+            ? ConnectivityMode::kBleRelay
+            : ConnectivityMode::kWifiDirect;
+        ESP_LOGI(TAG, "Loaded preferred connectivity mode: %s (raw=%d)",
+            ConnectivityModeToString(connectivity_mode_), preferred_mode);
     }
 }
 
@@ -69,7 +105,84 @@ void WifiBoard::EnterWifiConfigMode() {
     }
 }
 
+void WifiBoard::ShowBleRelayHint(bool pairing) {
+    auto& application = Application::GetInstance();
+    auto display = GetDisplay();
+    std::string hint = pairing ? std::string(Lang::Strings::PAIR_PHONE) : std::string(Lang::Strings::WAITING_PHONE);
+
+    if (pairing) {
+        auto pair_code = BleRelayManager::GetInstance().GetPairCode();
+        hint += "\n";
+        hint += Lang::Strings::BLE_PAIR_CODE;
+        hint += pair_code;
+        application.ShowPairCode(pair_code, hint);
+    } else {
+        display->SetStatus(Lang::Strings::BLE_RELAY_MODE);
+        display->SetChatMessage("system", hint.c_str());
+    }
+}
+
+void WifiBoard::EnterBleRelayMode(bool force_pairing) {
+    ESP_LOGI(TAG, "Entering BLE relay mode%s", force_pairing ? " with force pairing" : "");
+    auto& application = Application::GetInstance();
+    application.SetDeviceState(kDeviceStateBleConfiguring);
+
+    auto& relay = BleRelayManager::GetInstance();
+    relay.SetDisconnectCallback([this]() {
+        if (connectivity_mode_ != ConnectivityMode::kBleRelay) {
+            return;
+        }
+
+        auto& app = Application::GetInstance();
+        auto state = app.GetDeviceState();
+        if (state == kDeviceStateStarting || state == kDeviceStateUpgrading) {
+            return;
+        }
+        app.SetDeviceState(kDeviceStateBleConfiguring);
+        GetDisplay()->ShowNotification(Lang::Strings::WAITING_PHONE, 3000);
+    });
+    relay.SetReadyCallback([this]() {
+        if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+            auto& app = Application::GetInstance();
+            if (app.IsRuntimeReady() && app.GetDeviceState() == kDeviceStateBleConfiguring) {
+                ESP_LOGI(TAG, "BLE relay reconnected after app-side disconnect, restoring device state to idle");
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+            GetDisplay()->ShowNotification(Lang::Strings::BLE_CONNECTED, 3000);
+            app.NotifyBleRelayDeviceState();
+        }
+    });
+    relay.SetPairingCodeCallback([this](const std::string& pair_code) {
+        if (connectivity_mode_ != ConnectivityMode::kBleRelay || pair_code.empty()) {
+            return;
+        }
+        std::string hint = std::string(Lang::Strings::PAIR_PHONE) + "\n" + Lang::Strings::BLE_PAIR_CODE + pair_code;
+        Application::GetInstance().ShowPairCode(pair_code, hint);
+    });
+    relay.Start();
+    if (force_pairing) {
+        ESP_LOGI(TAG, "BLE relay started, clearing binding to force pairing");
+        relay.ClearBinding();
+    }
+
+    ShowBleRelayHint(relay.NeedsPairing());
+    relay.WaitForReady(portMAX_DELAY);
+}
+
 void WifiBoard::StartNetwork() {
+    ESP_LOGI(TAG, "StartNetwork with connectivity mode: %s",
+        ConnectivityModeToString(connectivity_mode_));
+    if (kForceBleDebugPairing) {
+        ESP_LOGW(TAG, "Force BLE debug pairing is enabled, entering BLE relay mode with forced pairing");
+        EnterBleRelayMode(true);
+        return;
+    }
+
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        EnterBleRelayMode();
+        return;
+    }
+
     // User can press BOOT button while starting to enter WiFi configuration mode
     if (wifi_config_mode_) {
         EnterWifiConfigMode();
@@ -145,30 +258,40 @@ void WifiBoard::StartNetwork() {
 }
 
 Http* WifiBoard::CreateHttp() {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return new BleRelayHttp();
+    }
     return new EspHttp();
 }
 
-WebSocket* WifiBoard::CreateWebSocket() {
-#ifdef CONFIG_CONNECTION_TYPE_WEBSOCKET
-    std::string url = CONFIG_WEBSOCKET_URL;
+WebSocket* WifiBoard::CreateWebSocket(const std::string& url) {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return new WebSocket(new BleRelayTransport(url.find("wss://") == 0));
+    }
     if (url.find("wss://") == 0) {
         return new WebSocket(new TlsTransport());
-    } else {
-        return new WebSocket(new TcpTransport());
     }
-#endif
-    return nullptr;
+    return new WebSocket(new TcpTransport());
 }
 
 Mqtt* WifiBoard::CreateMqtt() {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return nullptr;
+    }
     return new EspMqtt();
 }
 
 Udp* WifiBoard::CreateUdp() {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return nullptr;
+    }
     return new EspUdp();
 }
 
 const char* WifiBoard::GetNetworkStateIcon() {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return FONT_AWESOME_BLUETOOTH;
+    }
     if (wifi_config_mode_) {
         return FONT_AWESOME_WIFI;
     }
@@ -191,7 +314,12 @@ std::string WifiBoard::GetBoardJson() {
     auto& wifi_manager = WifiManager::GetInstance();
     std::string board_json = std::string("{\"type\":\"" BOARD_TYPE "\",");
     board_json += "\"name\":\"" BOARD_NAME "\",";
-    if (!wifi_config_mode_) {
+    board_json += "\"connectivity_mode\":\"" + std::string(ConnectivityModeToString(connectivity_mode_)) + "\",";
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        auto& relay = BleRelayManager::GetInstance();
+        board_json += "\"ble_state\":\"" + std::string(RelayLinkStateToString(relay.GetState())) + "\",";
+        board_json += "\"ble_bound\":" + std::to_string(relay.IsBound() ? 1 : 0) + ",";
+    } else if (!wifi_config_mode_) {
         board_json += "\"ssid\":\"" + wifi_manager.GetSsid() + "\",";
         board_json += "\"rssi\":" + std::to_string(wifi_manager.GetRssi()) + ",";
         board_json += "\"channel\":" + std::to_string(wifi_manager.GetChannel()) + ",";
@@ -202,8 +330,22 @@ std::string WifiBoard::GetBoardJson() {
 }
 
 void WifiBoard::SetPowerSaveMode(bool enabled) {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return;
+    }
     auto& wifi_manager = WifiManager::GetInstance();
     wifi_manager.SetPowerSaveLevel(enabled ? WifiPowerSaveLevel::BALANCED : WifiPowerSaveLevel::PERFORMANCE);
+}
+
+ConnectivityMode WifiBoard::GetConnectivityMode() const {
+    return connectivity_mode_;
+}
+
+bool WifiBoard::IsNetworkReady() const {
+    if (connectivity_mode_ == ConnectivityMode::kBleRelay) {
+        return BleRelayManager::GetInstance().IsConnected();
+    }
+    return WifiManager::GetInstance().IsConnected();
 }
 
 void WifiBoard::ResetWifiConfiguration() {
@@ -212,8 +354,40 @@ void WifiBoard::ResetWifiConfiguration() {
         Settings settings("wifi", true);
         settings.SetInt("force_ap", 1);
     }
+    {
+        Settings settings(kConnectivityNamespace, true);
+        settings.SetInt(kPreferredModeKey, static_cast<int32_t>(ConnectivityMode::kWifiDirect));
+    }
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
     vTaskDelay(pdMS_TO_TICKS(1000));
     // Reboot the device
+    esp_restart();
+}
+
+void WifiBoard::ResetBleConfiguration() {
+    {
+        Settings settings(kConnectivityNamespace, true);
+        settings.SetInt(kPreferredModeKey, static_cast<int32_t>(ConnectivityMode::kBleRelay));
+    }
+    BleRelayManager::GetInstance().ClearBinding();
+    GetDisplay()->ShowNotification(Lang::Strings::BLE_BIND_CLEARED);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
+void WifiBoard::ToggleConnectivityMode() {
+    connectivity_mode_ = connectivity_mode_ == ConnectivityMode::kBleRelay
+        ? ConnectivityMode::kWifiDirect
+        : ConnectivityMode::kBleRelay;
+    ESP_LOGI(TAG, "Toggling connectivity mode to %s",
+        ConnectivityModeToString(connectivity_mode_));
+    {
+        Settings settings(kConnectivityNamespace, true);
+        settings.SetInt(kPreferredModeKey, static_cast<int32_t>(connectivity_mode_));
+    }
+    GetDisplay()->ShowNotification(connectivity_mode_ == ConnectivityMode::kBleRelay
+        ? Lang::Strings::SWITCH_TO_BLE
+        : Lang::Strings::SWITCH_TO_WIFI);
+    vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
 }

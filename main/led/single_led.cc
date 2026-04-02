@@ -128,6 +128,10 @@ void SingleLed::OnStateChanged() {
             SetColor(0, 0, DEFAULT_BRIGHTNESS);
             StartContinuousBlink(500);
             break;
+        case kDeviceStateBleConfiguring:
+            SetColor(0, DEFAULT_BRIGHTNESS, DEFAULT_BRIGHTNESS);
+            StartContinuousBlink(250);
+            break;
         case kDeviceStateIdle:
             TurnOff();
             break;

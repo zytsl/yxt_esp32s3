@@ -210,6 +210,10 @@ void GpioLed::OnStateChanged() {
             SetBrightness(DEFAULT_BRIGHTNESS);
             StartContinuousBlink(500);
             break;
+        case kDeviceStateBleConfiguring:
+            SetBrightness(DEFAULT_BRIGHTNESS);
+            StartContinuousBlink(250);
+            break;
         case kDeviceStateIdle:
             SetBrightness(IDLE_BRIGHTNESS);
             TurnOn();

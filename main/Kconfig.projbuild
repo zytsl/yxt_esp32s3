@@ -2,7 +2,7 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Default OTA URL"
-    default "https://api.tenclass.net/xiaozhi/ota/"
+    default "http://47.93.153.35:18003/xiaozhi/ota/"
     help
         The application will access this URL to check for new firmwares and server address.
 
@@ -29,7 +29,7 @@ config CUSTOM_WAKE_WORD
 
 config CUSTOM_WAKE_WORD_DISPLAY
     string "Custom Wake Word Display"
-    default "小土豆"
+    default "你好小豚"
     depends on USE_CUSTOM_WAKE_WORD
     help
         Greeting sent to the server after wake word detection
@@ -73,7 +73,7 @@ endchoice
 
 config WEBSOCKET_URL
     string "Websocket URL"
-    default "wss://api.tenclass.net/xiaozhi/v1/"
+    default "ws://47.93.153.35:18000/xiaozhi/v1/"
     help
         Communication with the server through websocket after wake up.
 
@@ -136,4 +136,17 @@ config USE_REALTIME_CHAT
     help
         需要 ESP32 S3 与 AEC 开启，因为性能不够，不建议和微信聊天界面风格同时开启
         
+config ENABLE_BLE_RELAY
+    bool "Enable BLE relay transport"
+    default y
+    depends on IDF_TARGET_ESP32S3
+    help
+        Enable BLE relay mode that connects the device to a phone app.
+
+config BLE_RELAY_DEVICE_NAME_PREFIX
+    string "BLE relay device name prefix"
+    default "XiaoTun"
+    depends on ENABLE_BLE_RELAY
+    help
+        Prefix used for the BLE peripheral name shown to the mobile app.
 endmenu

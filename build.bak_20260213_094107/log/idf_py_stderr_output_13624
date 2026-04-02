@@ -1,0 +1,34 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Espressif\tools\python\v5.5.2\venv\Scripts\python.exe -DESP_PLATFORM=1 -DIDF_TARGET=esp32s3 -DCCACHE_ENABLE=0 E:\youxiaotun\device_code\yxt_esp32s3
+fatal: bad config line 2 in file E:/esp/.espressif/v5.5.2/esp-idf/.git/modules/components/bt/controller/lib_esp32/config
+Submodule 'components/bootloader/subproject/components/micro-ecc/micro-ecc' (https://jihulab.com/esp-mirror/kmackay/micro-ecc.git) registered for path 'components/bootloader/subproject/components/micro-ecc/micro-ecc'
+Cloning into 'E:/esp/.espressif/v5.5.2/esp-idf/components/bootloader/subproject/components/micro-ecc/micro-ecc'...
+CMake Error at C:/Espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeTestCXXCompiler.cmake:73 (message):
+  The C++ compiler
+
+    "C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++.exe"
+
+  is not able to compile a simple test program.
+
+  It fails with the following output:
+
+    Change Dir: 'E:/youxiaotun/device_code/yxt_esp32s3/build/CMakeFiles/CMakeScratch/TryCompile-zay5oz'
+    
+    Run Build Command(s): C:/Espressif/tools/ninja/1.12.1/ninja.exe -v cmTC_3e8a3
+    [1/2] C:\Espressif\tools\xtensa-esp-elf\esp-14.2.0_20251107\xtensa-esp-elf\bin\xtensa-esp32s3-elf-g++.exe   -mlongcalls  -fno-builtin-memcpy -fno-builtin-memset -fno-builtin-bzero -fno-builtin-stpcpy -fno-builtin-strncpy -o CMakeFiles/cmTC_3e8a3.dir/testCXXCompiler.cxx.obj -c E:/youxiaotun/device_code/yxt_esp32s3/build/CMakeFiles/CMakeScratch/TryCompile-zay5oz/testCXXCompiler.cxx
+    [2/2] C:\Windows\system32\cmd.exe /C "cd . && C:\Espressif\tools\xtensa-esp-elf\esp-14.2.0_20251107\xtensa-esp-elf\bin\xtensa-esp32s3-elf-g++.exe -mlongcalls  -fno-builtin-memcpy -fno-builtin-memset -fno-builtin-bzero -fno-builtin-stpcpy -fno-builtin-strncpy -nostartfiles CMakeFiles/cmTC_3e8a3.dir/testCXXCompiler.cxx.obj -o cmTC_3e8a3   && cd ."
+    FAILED: cmTC_3e8a3 
+    C:\Windows\system32\cmd.exe /C "cd . && C:\Espressif\tools\xtensa-esp-elf\esp-14.2.0_20251107\xtensa-esp-elf\bin\xtensa-esp32s3-elf-g++.exe -mlongcalls  -fno-builtin-memcpy -fno-builtin-memset -fno-builtin-bzero -fno-builtin-stpcpy -fno-builtin-strncpy -nostartfiles CMakeFiles/cmTC_3e8a3.dir/testCXXCompiler.cxx.obj -o cmTC_3e8a3   && cd ."
+    C:/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/../lib/gcc/xtensa-esp-elf/14.2.0/../../../../xtensa-esp-elf/bin/ld.exe: cannot find -lstdc++: No such file or directory
+    collect2.exe: error: ld returned 1 exit status
+    ninja: build stopped: subcommand failed.
+    
+    
+
+  
+
+  CMake will not be able to correctly generate this project.
+Call Stack (most recent call first):
+  E:/esp/.espressif/v5.5.2/esp-idf/tools/cmake/project.cmake:589 (__project)
+  CMakeLists.txt:13 (project)
+
+

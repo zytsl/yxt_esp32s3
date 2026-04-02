@@ -9,6 +9,12 @@
         "VERSION": "Ver ",
         "LOADING_PROTOCOL": "Logging in...",
         "CHECKING_NEW_VERSION": "Checking for new version...",
+        "BLE_BIND_CLEARED": "BLE binding cleared",
+        "BLE_CONNECTED": "Phone connected",
+        "BLE_PAIR_CODE": "BLE pair code ",
+        "BLE_RELAY_ERROR": "BLE relay unavailable",
+        "BLE_RELAY_MODE": "BLE Relay Mode",
+        "BLE_RELAY_UNSUPPORTED": "BLE mode does not support MQTT config",
         "INITIALIZING": "Initializing...",
         "PIN_ERROR": "Please insert SIM card",
         "REG_ERROR": "Unable to access network, please check SIM card status",
@@ -23,6 +29,7 @@
 
         "LISTENING": "Listening...",
         "SPEAKING": "Speaking...",
+        "WAITING_PHONE": "Waiting for paired phone",
 
         "SERVER_NOT_FOUND": "Looking for available service",
         "SERVER_NOT_CONNECTED": "Unable to connect to service, please try again later",
@@ -37,6 +44,7 @@
 
         "NEW_VERSION": "New version ",
         "OTA_UPGRADE": "OTA Upgrade",
+        "PAIR_PHONE": "Use the mobile app to connect and enter the pair code",
         "UPGRADING": "System is upgrading...",
         "UPGRADE_FAILED": "Upgrade failed",
         "ACTIVATION": "Activation",
@@ -48,6 +56,8 @@
 
         "VOLUME": "Volume ",
         "MUTED": "Muted",
-        "MAX_VOLUME": "Max volume"
+        "MAX_VOLUME": "Max volume",
+        "SWITCH_TO_BLE": "Switching to BLE mode, rebooting...",
+        "SWITCH_TO_WIFI": "Switching to Wi-Fi mode, rebooting..."
     }
 }

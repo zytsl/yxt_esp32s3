@@ -36,6 +36,7 @@ enum DeviceState {
     kDeviceStateUnknown,
     kDeviceStateStarting,
     kDeviceStateWifiConfiguring,
+    kDeviceStateBleConfiguring,
     kDeviceStateIdle,
     kDeviceStateConnecting,
     kDeviceStateListening,
@@ -73,8 +74,11 @@ public:
     void WakeWordInvoke(const std::string& wake_word);
     void PlaySound(const std::string_view& sound);
     bool CanEnterSleepMode();
+    bool IsRuntimeReady() const { return runtime_ready_; }
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
+    void ShowPairCode(const std::string& code, const std::string& message);
     void ShowActivationCode(const std::string& code, const std::string& message);
+    void NotifyBleRelayDeviceState();
 
 private:
     Application();
@@ -102,6 +106,7 @@ private:
     bool aborted_ = false;
     bool voice_detected_ = false;
     bool busy_decoding_audio_ = false;
+    bool runtime_ready_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t check_new_version_task_handle_ = nullptr;
 

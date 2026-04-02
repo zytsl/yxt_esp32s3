@@ -177,6 +177,7 @@ void Display::Update() {
         kDeviceStateIdle,
         kDeviceStateStarting,
         kDeviceStateWifiConfiguring,
+        kDeviceStateBleConfiguring,
         kDeviceStateListening,
     };
     if (std::find(allowed_states.begin(), allowed_states.end(), device_state) != allowed_states.end()) {

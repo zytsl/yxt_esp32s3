@@ -1,0 +1,17 @@
+services:
+  ota-ws-server:
+    build:
+      context: ../../
+      dockerfile: deploy/local-server/Dockerfile
+    container_name: yxt-ota-ws-server
+    restart: unless-stopped
+    ports:
+      - "8780:8780"
+      - "8781:8781"
+    env_file:
+      - .env
+    command:
+      - --ws-url
+      - ${WS_PUBLIC_URL}
+      - --access-token
+      - ${WS_ACCESS_TOKEN}

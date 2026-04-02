@@ -4,6 +4,7 @@
 #include "system_info.h"
 #include "ml307_ssl_transport.h"
 #include "audio_codec.h"
+#include "ble_relay_manager.h"
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
 #include "font_awesome_symbols.h"
@@ -24,7 +25,8 @@
 static const char* const STATE_STRINGS[] = {
     "unknown",
     "starting",
-    "configuring",
+    "wifi_configuring",
+    "ble_configuring",
     "idle",
     "connecting",
     "listening",
@@ -187,6 +189,7 @@ void Application::StopListening() {
 
 void Application::Start() {
     auto& board = Board::GetInstance();
+    runtime_ready_ = false;
     SetDeviceState(kDeviceStateStarting);
 
     /* Setup the display */
@@ -256,6 +259,12 @@ void Application::Start() {
     if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
     } else if (ota_->HasMqttConfig()) {
+        if (board.GetConnectivityMode() == ConnectivityMode::kBleRelay) {
+            Alert(Lang::Strings::ERROR, Lang::Strings::BLE_RELAY_UNSUPPORTED, "sad", Lang::Sounds::P3_EXCLAMATION);
+            SetDeviceState(kDeviceStateBleConfiguring);
+            MainEventLoop();
+            return;
+        }
         protocol_ = std::make_unique<MqttProtocol>();
     } else {
 #ifdef CONFIG_CONNECTION_TYPE_WEBSOCKET
@@ -265,7 +274,12 @@ void Application::Start() {
 #endif
     }
     protocol_->OnNetworkError([this](const std::string& message) {
-        SetDeviceState(kDeviceStateIdle);
+        auto& board = Board::GetInstance();
+        if (board.GetConnectivityMode() == ConnectivityMode::kBleRelay && !board.IsNetworkReady()) {
+            SetDeviceState(kDeviceStateBleConfiguring);
+        } else {
+            SetDeviceState(kDeviceStateIdle);
+        }
         Alert(Lang::Strings::ERROR, message.c_str(), "sad", Lang::Sounds::P3_EXCLAMATION);
     });
     protocol_->OnIncomingAudio([this](std::vector<uint8_t>&& data) {
@@ -294,7 +308,12 @@ void Application::Start() {
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+            auto& current_board = Board::GetInstance();
+            if (current_board.GetConnectivityMode() == ConnectivityMode::kBleRelay && !current_board.IsNetworkReady()) {
+                SetDeviceState(kDeviceStateBleConfiguring);
+            } else {
+                SetDeviceState(kDeviceStateIdle);
+            }
         });
     });
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
@@ -440,6 +459,7 @@ void Application::Start() {
 
     // Wait for the new version check to finish
     SetDeviceState(kDeviceStateIdle);
+    runtime_ready_ = true;
     std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
     display->ShowNotification(message.c_str());
     display->SetChatMessage("system", "");
@@ -660,6 +680,35 @@ void Application::SetListeningMode(ListeningMode mode) {
     SetDeviceState(kDeviceStateListening);
 }
 
+void Application::NotifyBleRelayDeviceState() {
+    auto& board = Board::GetInstance();
+    if (board.GetConnectivityMode() != ConnectivityMode::kBleRelay) {
+        return;
+    }
+
+    auto& relay = BleRelayManager::GetInstance();
+    if (!relay.IsConnected()) {
+        return;
+    }
+
+    const bool ready = device_state_ == kDeviceStateIdle ||
+        device_state_ == kDeviceStateConnecting ||
+        device_state_ == kDeviceStateListening ||
+        device_state_ == kDeviceStateSpeaking;
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "event", "device_state");
+    cJSON_AddStringToObject(root, "state", STATE_STRINGS[device_state_]);
+    cJSON_AddBoolToObject(root, "ready", ready);
+    char* text = cJSON_PrintUnformatted(root);
+    if (text != nullptr) {
+        ESP_LOGI(TAG, "Publishing BLE device state: state=%s ready=%s", STATE_STRINGS[device_state_], ready ? "true" : "false");
+        relay.SendJsonFrame(BleRelayFrameType::kSocketEvent, 0, 0, text);
+        cJSON_free(text);
+    }
+    cJSON_Delete(root);
+}
+
 void Application::SetDeviceState(DeviceState state) {
     if (device_state_ == state) {
         return;
@@ -680,6 +729,26 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
+            display->SetEmotion("neutral");
+#if CONFIG_USE_AUDIO_PROCESSOR
+            audio_processor_.Stop();
+#endif
+#if CONFIG_USE_WAKE_WORD_DETECT
+            wake_word_detect_.StartDetection();
+#endif
+            break;
+        case kDeviceStateWifiConfiguring:
+            display->SetStatus(Lang::Strings::WIFI_CONFIG_MODE);
+            display->SetEmotion("neutral");
+#if CONFIG_USE_AUDIO_PROCESSOR
+            audio_processor_.Stop();
+#endif
+#if CONFIG_USE_WAKE_WORD_DETECT
+            wake_word_detect_.StartDetection();
+#endif
+            break;
+        case kDeviceStateBleConfiguring:
+            display->SetStatus(Lang::Strings::BLE_RELAY_MODE);
             display->SetEmotion("neutral");
 #if CONFIG_USE_AUDIO_PROCESSOR
             audio_processor_.Stop();
@@ -738,6 +807,8 @@ void Application::SetDeviceState(DeviceState state) {
             // Do nothing
             break;
     }
+
+    NotifyBleRelayDeviceState();
 }
 
 void Application::ResetDecoder() {
@@ -890,6 +961,48 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
         auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
             [digit](const digit_sound& ds) { return ds.digit == digit; });
         if (it != digit_sounds.end()) {
+            PlaySound(it->sound);
+        }
+    }
+}
+
+void Application::ShowPairCode(const std::string& code, const std::string& message) {
+    struct digit_sound {
+        char digit;
+        const std::string_view& sound;
+    };
+    static const std::array<digit_sound, 10> digit_sounds{{
+        digit_sound{'0', Lang::Sounds::P3_0},
+        digit_sound{'1', Lang::Sounds::P3_1},
+        digit_sound{'2', Lang::Sounds::P3_2},
+        digit_sound{'3', Lang::Sounds::P3_3},
+        digit_sound{'4', Lang::Sounds::P3_4},
+        digit_sound{'5', Lang::Sounds::P3_5},
+        digit_sound{'6', Lang::Sounds::P3_6},
+        digit_sound{'7', Lang::Sounds::P3_7},
+        digit_sound{'8', Lang::Sounds::P3_8},
+        digit_sound{'9', Lang::Sounds::P3_9}
+    }};
+
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetStatus(Lang::Strings::BLE_RELAY_MODE);
+    display->SetEmotion("link");
+    display->SetChatMessage("system", message.c_str());
+
+    auto codec = Board::GetInstance().GetAudioCodec();
+    ESP_LOGI(TAG, "ShowPairCode code=%s output_enabled=%s output_volume=%d",
+        code.c_str(), codec->output_enabled() ? "true" : "false", codec->output_volume());
+    if (!codec->output_enabled()) {
+        ESP_LOGW(TAG, "Audio output was disabled before pair code playback, enabling it");
+        codec->EnableOutput(true);
+    }
+
+    ResetDecoder();
+    for (const auto& digit : code) {
+        auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
+            [digit](const digit_sound& ds) { return ds.digit == digit; });
+        if (it != digit_sounds.end()) {
+            ESP_LOGI(TAG, "ShowPairCode playing digit=%c", digit);
             PlaySound(it->sound);
         }
     }

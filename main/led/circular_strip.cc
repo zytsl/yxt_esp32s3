@@ -197,6 +197,11 @@ void CircularStrip::OnStateChanged() {
             Blink(color, 500);
             break;
         }
+        case kDeviceStateBleConfiguring: {
+            StripColor color = { 0, default_brightness_, default_brightness_ };
+            Blink(color, 250);
+            break;
+        }
         case kDeviceStateIdle:
             FadeOut(50);
             break;

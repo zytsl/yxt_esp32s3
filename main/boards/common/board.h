@@ -7,6 +7,7 @@
 #include <udp.h>
 #include <string>
 
+#include "connectivity_mode.h"
 #include "led/led.h"
 #include "backlight.h"
 
@@ -40,7 +41,7 @@ public:
     virtual AudioCodec* GetAudioCodec() = 0;
     virtual Display* GetDisplay();
     virtual Http* CreateHttp() = 0;
-    virtual WebSocket* CreateWebSocket() = 0;
+    virtual WebSocket* CreateWebSocket(const std::string& url) = 0;
     virtual Mqtt* CreateMqtt() = 0;
     virtual Udp* CreateUdp() = 0;
     virtual void StartNetwork() = 0;
@@ -48,6 +49,8 @@ public:
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetJson();
     virtual void SetPowerSaveMode(bool enabled) = 0;
+    virtual ConnectivityMode GetConnectivityMode() const = 0;
+    virtual bool IsNetworkReady() const = 0;
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

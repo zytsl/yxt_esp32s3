@@ -10,7 +10,8 @@ public:
 #if CONFIG_SOC_ADC_SUPPORTED
     Button(const button_adc_config_t& cfg);
 #endif
-    Button(gpio_num_t gpio_num, bool active_high = false);
+    Button(gpio_num_t gpio_num, bool active_high = false,
+        uint16_t short_press_time_ms = 50, uint16_t long_press_time_ms = 1000);
     ~Button();
 
     void OnPressDown(std::function<void()> callback);

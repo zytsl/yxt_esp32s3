@@ -20,12 +20,15 @@
 #endif
 
 #define TAG "CompactWifiBoard"
+#define BOOT_TAG "BootButton"
 
 LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_awesome_14_1);
 
 class CompactWifiBoard : public WifiBoard {
 private:
+    static constexpr uint16_t kBootShortPressTimeMs = 300;
+    static constexpr uint16_t kBootLongPressTimeMs = 1000;
     i2c_master_bus_handle_t display_i2c_bus_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
@@ -105,11 +108,28 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            ESP_LOGI(BOOT_TAG, "Single click detected");
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiManager::GetInstance().IsConnected()) {
+            app.ToggleChatState();
+        });
+        boot_button_.OnDoubleClick([this]() {
+            auto state = Application::GetInstance().GetDeviceState();
+            ESP_LOGI(BOOT_TAG, "Double click detected, state=%d", state);
+            if (state == kDeviceStateIdle ||
+                state == kDeviceStateWifiConfiguring ||
+                state == kDeviceStateBleConfiguring) {
+                ESP_LOGI(BOOT_TAG, "Switching connectivity mode");
+                ToggleConnectivityMode();
+            }
+        });
+        boot_button_.OnLongPress([this]() {
+            ESP_LOGI(BOOT_TAG, "Long press detected, mode=%s",
+                ConnectivityModeToString(GetConnectivityMode()));
+            if (GetConnectivityMode() == ConnectivityMode::kBleRelay) {
+                ResetBleConfiguration();
+            } else {
                 ResetWifiConfiguration();
             }
-            app.ToggleChatState();
         });
         touch_button_.OnPressDown([this]() {
             Application::GetInstance().StartListening();
@@ -158,7 +178,7 @@ private:
 
 public:
     CompactWifiBoard() :
-        boot_button_(BOOT_BUTTON_GPIO),
+        boot_button_(BOOT_BUTTON_GPIO, false, kBootShortPressTimeMs, kBootLongPressTimeMs),
         touch_button_(TOUCH_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
