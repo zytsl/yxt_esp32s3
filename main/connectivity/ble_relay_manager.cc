@@ -629,7 +629,12 @@ void BleRelayManager::HandleAuthResponse(const std::string& json) {
 }
 
 void BleRelayManager::HandleHeartbeat() {
+    std::lock_guard<std::mutex> lock(mutex_);
     last_rx_time_us_ = esp_timer_get_time();
+    if (state_ == RelayLinkState::kPairing || state_ == RelayLinkState::kAuthenticating) {
+        ESP_LOGI(TAG, "Heartbeat received while handshake is pending, replaying handshake");
+        SendCurrentHandshakeLocked();
+    }
 }
 
 void BleRelayManager::NotifyHandlersDisconnectedLocked() {
@@ -651,18 +656,28 @@ void BleRelayManager::SendCurrentHandshakeLocked() {
         cJSON_AddStringToObject(root, "client_id", Board::GetInstance().GetUuid().c_str());
         char* text = cJSON_PrintUnformatted(root);
         if (text != nullptr) {
-            SendFragmentsLocked(BleRelayFrameType::kPairRequest, 0, 0,
-                reinterpret_cast<const uint8_t*>(text), strlen(text));
+            if (!SendFragmentsLocked(BleRelayFrameType::kPairRequest, 0, 0,
+                    reinterpret_cast<const uint8_t*>(text), strlen(text))) {
+                ESP_LOGW(TAG, "Pair request notify was not sent conn=%u notify_handle=%u",
+                    conn_handle_, notify_val_handle_);
+            }
             cJSON_free(text);
         }
     } else {
         ESP_LOGI(TAG, "Sending auth request to app for peer_id=%s", peer_id_.c_str());
         auth_started_time_us_ = esp_timer_get_time();
+        if (heartbeat_timer_ != nullptr) {
+            esp_timer_stop(heartbeat_timer_);
+            esp_timer_start_periodic(heartbeat_timer_, 5000000);
+        }
         cJSON_AddStringToObject(root, "peer_id", peer_id_.c_str());
         char* text = cJSON_PrintUnformatted(root);
         if (text != nullptr) {
-            SendFragmentsLocked(BleRelayFrameType::kAuthRequest, 0, 0,
-                reinterpret_cast<const uint8_t*>(text), strlen(text));
+            if (!SendFragmentsLocked(BleRelayFrameType::kAuthRequest, 0, 0,
+                    reinterpret_cast<const uint8_t*>(text), strlen(text))) {
+                ESP_LOGW(TAG, "Auth request notify was not sent conn=%u notify_handle=%u",
+                    conn_handle_, notify_val_handle_);
+            }
             cJSON_free(text);
         }
     }
@@ -787,7 +802,13 @@ int BleRelayManager::GapEvent(ble_gap_event* event, void* arg) {
         }
         case BLE_GAP_EVENT_SUBSCRIBE: {
             std::lock_guard<std::mutex> lock(relay->mutex_);
-            if (event->subscribe.attr_handle == relay->notify_val_handle_ && event->subscribe.cur_notify) {
+            ESP_LOGI(TAG, "Subscribe event attr=%u notify_handle=%u cur_notify=%d cur_indicate=%d",
+                event->subscribe.attr_handle,
+                relay->notify_val_handle_,
+                event->subscribe.cur_notify,
+                event->subscribe.cur_indicate);
+            if (event->subscribe.cur_notify &&
+                (event->subscribe.attr_handle == relay->notify_val_handle_ || relay->notify_val_handle_ != 0)) {
                 ESP_LOGI(TAG, "Notify subscribed by app, sending handshake");
                 if (!relay->bound_ || relay->force_pairing_) {
                     pairing_code_cb = relay->pairing_code_callback_;
@@ -862,6 +883,7 @@ void BleRelayManager::HeartbeatTimer(void* arg) {
     std::function<void()> disconnect_cb;
     std::function<void(const std::string&)> pairing_code_cb;
     std::string pair_code;
+    bool fallback_to_pairing = false;
 
     {
         std::lock_guard<std::mutex> lock(relay->mutex_);
@@ -876,9 +898,9 @@ void BleRelayManager::HeartbeatTimer(void* arg) {
             relay->FallbackToPairingLocked("authentication timeout");
             pairing_code_cb = relay->pairing_code_callback_;
             pair_code = relay->pair_code_;
-            return;
+            fallback_to_pairing = true;
         }
-        if (relay->last_rx_time_us_ != 0 && now - relay->last_rx_time_us_ > 15000000) {
+        if (!fallback_to_pairing && relay->last_rx_time_us_ != 0 && now - relay->last_rx_time_us_ > 15000000) {
             ble_gap_terminate(relay->conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
             relay->conn_handle_ = 0xFFFF;
             relay->auth_started_time_us_ = 0;
@@ -895,6 +917,9 @@ void BleRelayManager::HeartbeatTimer(void* arg) {
 
     if (pairing_code_cb && !pair_code.empty()) {
         pairing_code_cb(pair_code);
+        return;
+    }
+    if (fallback_to_pairing) {
         return;
     }
     relay->SendJsonFrame(BleRelayFrameType::kHeartbeat, 0, 0, "{}");
