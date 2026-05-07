@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <sstream>
 #include <esp_mn_speech_commands.h>
+#include <algorithm>
 
 #define DETECTION_RUNNING_EVENT 1
 
@@ -46,7 +47,30 @@ void WakeWordDetect::Initialize(AudioCodec* codec) {
         float threshold = CONFIG_CUSTOM_WAKE_WORD_THRESHOLD / 100.0f;
         multinet_->set_det_threshold(multinet_model_data_, threshold);
 
-        commands_.push_back({CONFIG_CUSTOM_WAKE_WORD, CONFIG_CUSTOM_WAKE_WORD_DISPLAY, "wake"});
+        auto add_wake_command = [this](std::string command) {
+            command.erase(0, command.find_first_not_of(" \t\r\n"));
+            auto end = command.find_last_not_of(" \t\r\n");
+            if (end == std::string::npos) {
+                return;
+            }
+            command.erase(end + 1);
+            if (command.empty()) {
+                return;
+            }
+            auto exists = std::any_of(commands_.begin(), commands_.end(), [&command](const Command& item) {
+                return item.command == command;
+            });
+            if (!exists) {
+                commands_.push_back({command, CONFIG_CUSTOM_WAKE_WORD_DISPLAY, "wake"});
+            }
+        };
+        add_wake_command(CONFIG_CUSTOM_WAKE_WORD);
+        std::stringstream alias_stream(CONFIG_CUSTOM_WAKE_WORD_ALIASES);
+        std::string alias;
+        while (std::getline(alias_stream, alias, ';')) {
+            add_wake_command(alias);
+        }
+        ESP_LOGI(TAG, "Custom wake threshold=%.2f commands=%zu", threshold, commands_.size());
         esp_mn_commands_clear();
         for (int i = 0; i < commands_.size(); i++) {
             esp_mn_commands_add(i + 1, const_cast<char*>(commands_[i].command.c_str()));

@@ -34,13 +34,21 @@ config CUSTOM_WAKE_WORD_DISPLAY
     help
         Greeting sent to the server after wake word detection
 
+config CUSTOM_WAKE_WORD_ALIASES
+    string "Custom Wake Word Aliases"
+    default "ni hao xiao tong;ni hao xiao tun"
+    depends on USE_CUSTOM_WAKE_WORD
+    help
+        Extra pinyin phrases that map to the same wake action, separated by semicolons.
+        This helps custom MultiNet wake words tolerate common pronunciation variants.
+
 config CUSTOM_WAKE_WORD_THRESHOLD
     int "Custom Wake Word Threshold (%)"
-    default 20
+    default 10
     range 1 99
     depends on USE_CUSTOM_WAKE_WORD
     help
-        Custom Wake Word Threshold, range 1-99, the smaller the more sensitive, default 20
+        Custom Wake Word Threshold, range 1-99, the smaller the more sensitive, default 10
 
 
 choice
