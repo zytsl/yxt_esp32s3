@@ -26,6 +26,10 @@
 
 #define TAG "BleRelay"
 
+#ifndef CONFIG_BLE_RELAY_DEVICE_NAME_PREFIX
+#define CONFIG_BLE_RELAY_DEVICE_NAME_PREFIX "XiaoTun"
+#endif
+
 namespace {
 constexpr EventBits_t kRelayReadyBit = 1 << 0;
 constexpr EventBits_t kRelayConnectedBit = 1 << 1;
