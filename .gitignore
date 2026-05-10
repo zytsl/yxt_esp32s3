@@ -1,13 +1,35 @@
-tmp/
-components/
-managed_components/
-build/
+# OS/editor noise
+.DS_Store
 .vscode/
 .devcontainer/
-sdkconfig.old
-sdkconfig
-dependencies.lock
+
+# Local environment and runtime state
 .env
-releases/
+.env.*
+!.env.example
+.run/
+*.log
+tmp/
+__pycache__/
+*.py[cod]
+
+# ESP-IDF/CMake generated outputs
+build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.elf
+*.map
+
+# ESP-IDF local/generated project files
+sdkconfig
+sdkconfig.old
+sdkconfig.*.old
+managed_components/
+components/
+dependencies.lock
 main/assets/lang_config.h
-.DS_Store
+
+# Release artifacts
+releases/
