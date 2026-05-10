@@ -12,6 +12,7 @@
 #include "assets/lang_config.h"
 
 #include <cstring>
+#include <cstdint>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -21,6 +22,11 @@
 
 #define TAG "Application"
 
+namespace {
+constexpr int kListeningIdleTimeoutMs = 12000;
+constexpr int64_t kListeningVoiceActivityThreshold = 700;
+constexpr char kListeningIdleGoodbye[] = "我先休息啦，需要时再叫我。";
+}
 
 static const char* const STATE_STRINGS[] = {
     "unknown",
@@ -306,6 +312,9 @@ void Application::Start() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveMode(true);
         Schedule([this]() {
+            if (listening_idle_timed_out_) {
+                return;
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             auto& current_board = Board::GetInstance();
@@ -417,6 +426,7 @@ void Application::Start() {
             Schedule([this, speaking]() {
                 if (speaking) {
                     voice_detected_ = true;
+                    MarkListeningActivity();
                 } else {
                     voice_detected_ = false;
                 }
@@ -473,6 +483,7 @@ void Application::Start() {
 
 void Application::OnClockTimer() {
     clock_ticks_++;
+    CheckListeningIdleTimeout();
 
     // Print the debug info every 10 seconds
     if (clock_ticks_ % 10 == 0) {
@@ -617,6 +628,9 @@ void Application::OnAudioInput() {
     if (device_state_ == kDeviceStateListening) {
         std::vector<int16_t> data;
         ReadAudio(data, 16000, 30 * 16000 / 1000);
+        if (HasVoiceActivity(data)) {
+            MarkListeningActivity();
+        }
         background_task_->Schedule([this, data = std::move(data)]() mutable {
             if (protocol_->IsAudioChannelBusy()) {
                 return;
@@ -677,7 +691,66 @@ void Application::AbortSpeaking(AbortReason reason) {
 
 void Application::SetListeningMode(ListeningMode mode) {
     listening_mode_ = mode;
+    auto now = std::chrono::steady_clock::now();
+    listening_started_time_ = now;
+    last_listening_activity_time_ = now;
+    listening_idle_timed_out_ = false;
     SetDeviceState(kDeviceStateListening);
+}
+
+void Application::MarkListeningActivity() {
+    if (device_state_ != kDeviceStateListening) {
+        return;
+    }
+    last_listening_activity_time_ = std::chrono::steady_clock::now();
+}
+
+void Application::CheckListeningIdleTimeout() {
+    if (device_state_ != kDeviceStateListening ||
+        listening_mode_ != kListeningModeAutoStop ||
+        listening_idle_timed_out_) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto reference = last_listening_activity_time_ > listening_started_time_
+        ? last_listening_activity_time_
+        : listening_started_time_;
+    auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - reference).count();
+    if (idle_ms < kListeningIdleTimeoutMs) {
+        return;
+    }
+
+    listening_idle_timed_out_ = true;
+    Schedule([this]() {
+        HandleListeningIdleTimeout();
+    });
+}
+
+void Application::HandleListeningIdleTimeout() {
+    if (device_state_ != kDeviceStateListening || protocol_ == nullptr) {
+        return;
+    }
+    ESP_LOGI(TAG, "Listening idle timeout, closing audio channel");
+    protocol_->SendStopListening();
+    protocol_->CloseAudioChannel();
+    SetDeviceState(kDeviceStateIdle);
+
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetChatMessage("assistant", kListeningIdleGoodbye);
+    ResetDecoder();
+    PlaySound(Lang::Sounds::P3_SUCCESS);
+}
+
+bool Application::HasVoiceActivity(const std::vector<int16_t>& data) const {
+    if (data.empty()) {
+        return false;
+    }
+    int64_t sum_abs = 0;
+    for (auto sample : data) {
+        sum_abs += sample >= 0 ? sample : -static_cast<int64_t>(sample);
+    }
+    return (sum_abs / static_cast<int64_t>(data.size())) > kListeningVoiceActivityThreshold;
 }
 
 void Application::NotifyBleRelayDeviceState() {
@@ -763,6 +836,12 @@ void Application::SetDeviceState(DeviceState state) {
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
+            if (previous_state != kDeviceStateListening) {
+                auto now = std::chrono::steady_clock::now();
+                listening_started_time_ = now;
+                last_listening_activity_time_ = now;
+                listening_idle_timed_out_ = false;
+            }
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 

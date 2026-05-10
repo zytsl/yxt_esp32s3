@@ -114,6 +114,9 @@ private:
     TaskHandle_t audio_loop_task_handle_ = nullptr;
     BackgroundTask* background_task_ = nullptr;
     std::chrono::steady_clock::time_point last_output_time_;
+    std::chrono::steady_clock::time_point listening_started_time_;
+    std::chrono::steady_clock::time_point last_listening_activity_time_;
+    bool listening_idle_timed_out_ = false;
     std::list<std::vector<uint8_t>> audio_decode_queue_;
     std::condition_variable audio_decode_cv_;
 
@@ -135,6 +138,10 @@ private:
     void OnClockTimer();
     void SetListeningMode(ListeningMode mode);
     void AudioLoop();
+    void MarkListeningActivity();
+    void CheckListeningIdleTimeout();
+    void HandleListeningIdleTimeout();
+    bool HasVoiceActivity(const std::vector<int16_t>& data) const;
 };
 
 #endif // _APPLICATION_H_
