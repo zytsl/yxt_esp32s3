@@ -33,6 +33,8 @@ namespace {
 constexpr const char* kConnectivityNamespace = "connectivity";
 constexpr const char* kPreferredModeKey = "preferred_mode";
 constexpr bool kForceBleDebugPairing = false;
+constexpr int kWifiStationConnectTimeoutMs = 15000;
+constexpr int kWifiStationConnectPollMs = 100;
 }
 
 WifiBoard::WifiBoard() {
@@ -228,15 +230,14 @@ void WifiBoard::StartNetwork() {
     
     wifi_manager.StartStation();
 
-    // Try to connect to WiFi, if failed, launch the WiFi configuration AP
-    // Block for 60 seconds manually
-    int timeout_ticks = 60 * 1000 / 100;
-    while (timeout_ticks > 0) {
+    // Try to connect to WiFi briefly, then launch the WiFi configuration AP.
+    int timeout_ms = kWifiStationConnectTimeoutMs;
+    while (timeout_ms > 0) {
         if (wifi_manager.IsConnected()) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        timeout_ticks--;
+        vTaskDelay(pdMS_TO_TICKS(kWifiStationConnectPollMs));
+        timeout_ms -= kWifiStationConnectPollMs;
     }
 
     if (!wifi_manager.IsConnected()) {

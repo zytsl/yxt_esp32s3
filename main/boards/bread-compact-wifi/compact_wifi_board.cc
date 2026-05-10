@@ -115,7 +115,8 @@ private:
         boot_button_.OnDoubleClick([this]() {
             auto state = Application::GetInstance().GetDeviceState();
             ESP_LOGI(BOOT_TAG, "Double click detected, state=%d", state);
-            if (state == kDeviceStateIdle ||
+            if (state == kDeviceStateStarting ||
+                state == kDeviceStateIdle ||
                 state == kDeviceStateWifiConfiguring ||
                 state == kDeviceStateBleConfiguring) {
                 ESP_LOGI(BOOT_TAG, "Switching connectivity mode");
