@@ -75,7 +75,7 @@ public:
     void PlaySound(const std::string_view& sound);
     bool CanEnterSleepMode();
     bool IsRuntimeReady() const { return runtime_ready_; }
-    bool UpgradeFirmware(const std::string& url, const std::string& version = "");
+    bool UpgradeFirmware(const std::string& url, const std::string& version = "", const std::string& sha256 = "");
     void ShowPairCode(const std::string& code, const std::string& message);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void NotifyBleRelayDeviceState();

@@ -10,16 +10,49 @@
 #include <esp_app_format.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
+#include <mbedtls/constant_time.h>
+#include <mbedtls/sha256.h>
 #ifdef SOC_HMAC_SUPPORTED
 #include <esp_hmac.h>
 #endif
 
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <sstream>
 #include <algorithm>
 
 #define TAG "Ota"
+
+namespace {
+bool IsLowerHexSha256(const std::string& value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+bool DecodeSha256(const std::string& value, uint8_t output[32]) {
+    if (!IsLowerHexSha256(value)) return false;
+    auto nibble = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+    for (size_t i = 0; i < 32; ++i) {
+        output[i] = static_cast<uint8_t>((nibble(value[i * 2]) << 4) | nibble(value[i * 2 + 1]));
+    }
+    return true;
+}
+
+bool IsTrustedOtaUrl(const std::string& firmware_url) {
+    if (firmware_url.rfind("https://", 0) != 0) return false;
+    const size_t authority_start = 8;
+    const size_t authority_end = firmware_url.find('/', authority_start);
+    std::string host = firmware_url.substr(authority_start, authority_end - authority_start);
+    if (host.empty() || host.find('@') != std::string::npos) return false;
+    const size_t port = host.find(':');
+    if (port != std::string::npos) host.resize(port);
+    std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) { return std::tolower(c); });
+    return host == "animodoll.com" ||
+        (host.size() > 14 && host.compare(host.size() - 14, 14, ".animodoll.com") == 0);
+}
+}
 
 
 Ota::Ota() {
@@ -81,6 +114,10 @@ esp_err_t Ota::CheckVersion() {
     std::string url = GetCheckVersionUrl();
     if (url.length() < 10) {
         ESP_LOGE(TAG, "Check version URL is not properly set");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!IsTrustedOtaUrl(url)) {
+        ESP_LOGE(TAG, "OTA check URL is not on the production HTTPS allowlist");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -219,8 +256,13 @@ esp_err_t Ota::CheckVersion() {
         if (cJSON_IsString(url)) {
             firmware_url_ = url->valuestring;
         }
+        cJSON *sha256 = cJSON_GetObjectItem(firmware, "sha256");
+        if (cJSON_IsString(sha256)) {
+            firmware_sha256_ = sha256->valuestring;
+        }
 
-        if (cJSON_IsString(version) && cJSON_IsString(url)) {
+        if (cJSON_IsString(version) && cJSON_IsString(url) && cJSON_IsString(sha256) &&
+            IsLowerHexSha256(firmware_sha256_) && IsTrustedOtaUrl(firmware_url_)) {
             // Check if the version is newer, for example, 0.1.0 is newer than 0.0.1
             has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
             if (has_new_version_) {
@@ -228,11 +270,8 @@ esp_err_t Ota::CheckVersion() {
             } else {
                 ESP_LOGI(TAG, "Current is the latest version");
             }
-            // If the force flag is set to 1, the given version is forced to be installed
-            cJSON *force = cJSON_GetObjectItem(firmware, "force");
-            if (cJSON_IsNumber(force) && force->valueint == 1) {
-                has_new_version_ = true;
-            }
+        } else if (cJSON_IsString(version) || cJSON_IsString(url) || cJSON_IsString(sha256)) {
+            ESP_LOGE(TAG, "Rejecting incomplete or untrusted firmware manifest");
         }
     } else {
         ESP_LOGW(TAG, "No firmware section found!");
@@ -262,8 +301,14 @@ void Ota::MarkCurrentVersionValid() {
     }
 }
 
-bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback) {
+bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_sha256,
+    std::function<void(int progress, size_t speed)> callback) {
     ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
+    uint8_t expected_digest[32];
+    if (!IsTrustedOtaUrl(firmware_url) || !DecodeSha256(expected_sha256, expected_digest)) {
+        ESP_LOGE(TAG, "Rejecting OTA with untrusted URL or missing SHA-256 manifest digest");
+        return false;
+    }
     esp_ota_handle_t update_handle = 0;
     auto update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
@@ -284,12 +329,22 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 
     if (http->GetStatusCode() != 200) {
         ESP_LOGE(TAG, "Failed to get firmware, status code: %d", http->GetStatusCode());
+        http->Close();
         return false;
     }
 
     size_t content_length = http->GetBodyLength();
     if (content_length == 0) {
         ESP_LOGE(TAG, "Failed to get content length");
+        http->Close();
+        return false;
+    }
+
+    mbedtls_sha256_context sha256_context;
+    mbedtls_sha256_init(&sha256_context);
+    if (mbedtls_sha256_starts(&sha256_context, 0) != 0) {
+        mbedtls_sha256_free(&sha256_context);
+        http->Close();
         return false;
     }
 
@@ -303,6 +358,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
             if (ota_started) {
                 esp_ota_abort(update_handle);
             }
+            mbedtls_sha256_free(&sha256_context);
             http->Close();
             return false;
         }
@@ -323,6 +379,13 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         if (ret == 0) {
             break;
         }
+        if (mbedtls_sha256_update(&sha256_context,
+                reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(ret)) != 0) {
+            if (ota_started) esp_ota_abort(update_handle);
+            mbedtls_sha256_free(&sha256_context);
+            http->Close();
+            return false;
+        }
 
         if (!image_header_checked) {
             image_header.append(buffer, ret);
@@ -340,6 +403,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 
             if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to begin OTA");
+                mbedtls_sha256_free(&sha256_context);
                 http->Close();
                 return false;
             }
@@ -349,6 +413,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
             if (header_write != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to write buffered OTA header: %s", esp_err_to_name(header_write));
                 esp_ota_abort(update_handle);
+                mbedtls_sha256_free(&sha256_context);
                 http->Close();
                 return false;
             }
@@ -360,6 +425,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
             esp_ota_abort(update_handle);
+            mbedtls_sha256_free(&sha256_context);
             http->Close();
             return false;
         }
@@ -368,11 +434,23 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 
     if (!ota_started) {
         ESP_LOGE(TAG, "Firmware image ended before a complete image header was received");
+        mbedtls_sha256_free(&sha256_context);
         return false;
     }
     if (total_read != content_length) {
         ESP_LOGE(TAG, "Firmware length mismatch: read=%u expected=%u",
             static_cast<unsigned>(total_read), static_cast<unsigned>(content_length));
+        esp_ota_abort(update_handle);
+        mbedtls_sha256_free(&sha256_context);
+        return false;
+    }
+
+    uint8_t actual_digest[32];
+    const bool digest_ok = mbedtls_sha256_finish(&sha256_context, actual_digest) == 0 &&
+        mbedtls_ct_memcmp(actual_digest, expected_digest, sizeof(actual_digest)) == 0;
+    mbedtls_sha256_free(&sha256_context);
+    if (!digest_ok) {
+        ESP_LOGE(TAG, "Firmware SHA-256 does not match manifest metadata");
         esp_ota_abort(update_handle);
         return false;
     }
@@ -398,7 +476,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 }
 
 bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback) {
-    return Upgrade(firmware_url_, callback);
+    return Upgrade(firmware_url_, firmware_sha256_, callback);
 }
 
 

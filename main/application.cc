@@ -243,7 +243,7 @@ void Application::Start() {
     }
 
     if (ota_->HasNewVersion()) {
-        UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion());
+        UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion(), ota_->GetFirmwareSha256());
     }
     
     ota_->MarkCurrentVersionValid();
@@ -979,7 +979,7 @@ bool Application::CanEnterSleepMode() {
     return true;
 }
 
-bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
+bool Application::UpgradeFirmware(const std::string& url, const std::string& version, const std::string& sha256) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
 
@@ -1005,7 +1005,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    bool upgrade_success = Ota::Upgrade(upgrade_url, [display](int progress, size_t speed) {
+    bool upgrade_success = Ota::Upgrade(upgrade_url, sha256, [display](int progress, size_t speed) {
         char buffer[64];
         snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
         Application::GetInstance().Schedule([display, buffer_str = std::string(buffer)]() {
