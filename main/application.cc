@@ -773,9 +773,25 @@ void Application::NotifyBleRelayDeviceState() {
     cJSON_AddStringToObject(root, "event", "device_state");
     cJSON_AddStringToObject(root, "state", STATE_STRINGS[device_state_]);
     cJSON_AddBoolToObject(root, "ready", ready);
+
+    // Battery information
+    int battery_level = -1;
+    bool charging = false;
+    bool discharging = false;
+    if (board.GetBatteryLevel(battery_level, charging, discharging)) {
+        cJSON_AddNumberToObject(root, "battery_level", battery_level);
+        cJSON_AddBoolToObject(root, "battery_charging", charging);
+    }
+
+    // Volume information
+    auto codec = board.GetAudioCodec();
+    if (codec != nullptr) {
+        cJSON_AddNumberToObject(root, "volume", codec->output_volume());
+    }
+
     char* text = cJSON_PrintUnformatted(root);
     if (text != nullptr) {
-        ESP_LOGI(TAG, "Publishing BLE device state: state=%s ready=%s", STATE_STRINGS[device_state_], ready ? "true" : "false");
+        ESP_LOGI(TAG, "Publishing BLE device state: state=%s ready=%s battery=%d", STATE_STRINGS[device_state_], ready ? "true" : "false", battery_level);
         relay.SendJsonFrame(BleRelayFrameType::kSocketEvent, 0, 0, text);
         cJSON_free(text);
     }

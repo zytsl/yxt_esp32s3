@@ -71,7 +71,7 @@ private:
     void HandleHeartbeat();
     void NotifyHandlersDisconnectedLocked();
     void SendCurrentHandshakeLocked();
-    void FallbackToPairingLocked(const char* reason);
+    void RejectAuthenticationLocked(const char* reason);
     std::string GeneratePairCodeLocked();
     std::string GenerateSecretLocked();
     std::string ComputeProof(const std::string& nonce) const;

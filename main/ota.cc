@@ -273,6 +273,7 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 
     ESP_LOGI(TAG, "Writing to partition %s at offset 0x%lx", update_partition->label, update_partition->address);
     bool image_header_checked = false;
+    bool ota_started = false;
     std::string image_header;
 
     auto http = Board::GetInstance().CreateHttp();
@@ -299,6 +300,10 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
         int ret = http->Read(buffer, sizeof(buffer));
         if (ret < 0) {
             ESP_LOGE(TAG, "Failed to read HTTP data: %s", esp_err_to_name(ret));
+            if (ota_started) {
+                esp_ota_abort(update_handle);
+            }
+            http->Close();
             return false;
         }
 
@@ -321,31 +326,56 @@ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progre
 
         if (!image_header_checked) {
             image_header.append(buffer, ret);
-            if (image_header.size() >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
-                esp_app_desc_t new_app_info;
-                memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
-                
-                auto current_version = esp_app_get_description()->version;
-                ESP_LOGI(TAG, "Current version: %s, New version: %s", current_version, new_app_info.version);
-
-                if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle)) {
-                    esp_ota_abort(update_handle);
-                    ESP_LOGE(TAG, "Failed to begin OTA");
-                    return false;
-                }
-
-                image_header_checked = true;
-                std::string().swap(image_header);
+            const size_t required_header_size =
+                sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t);
+            if (image_header.size() < required_header_size) {
+                continue;
             }
+
+            esp_app_desc_t new_app_info;
+            memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
+
+            auto current_version = esp_app_get_description()->version;
+            ESP_LOGI(TAG, "Current version: %s, New version: %s", current_version, new_app_info.version);
+
+            if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to begin OTA");
+                http->Close();
+                return false;
+            }
+            ota_started = true;
+
+            auto header_write = esp_ota_write(update_handle, image_header.data(), image_header.size());
+            if (header_write != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to write buffered OTA header: %s", esp_err_to_name(header_write));
+                esp_ota_abort(update_handle);
+                http->Close();
+                return false;
+            }
+            image_header_checked = true;
+            std::string().swap(image_header);
+            continue;
         }
         auto err = esp_ota_write(update_handle, buffer, ret);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
             esp_ota_abort(update_handle);
+            http->Close();
             return false;
         }
     }
     http->Close();
+
+    if (!ota_started) {
+        ESP_LOGE(TAG, "Firmware image ended before a complete image header was received");
+        return false;
+    }
+    if (total_read != content_length) {
+        ESP_LOGE(TAG, "Firmware length mismatch: read=%u expected=%u",
+            static_cast<unsigned>(total_read), static_cast<unsigned>(content_length));
+        esp_ota_abort(update_handle);
+        return false;
+    }
 
     esp_err_t err = esp_ota_end(update_handle);
     if (err != ESP_OK) {

@@ -333,23 +333,14 @@ void BleRelayManager::UpdateState(RelayLinkState state) {
     }
 }
 
-void BleRelayManager::FallbackToPairingLocked(const char* reason) {
-    ESP_LOGW(TAG, "Falling back to pairing: %s", reason);
-    bound_ = false;
-    force_pairing_ = true;
-    peer_id_.clear();
-    secret_.clear();
-    auth_failures_ = 0;
+void BleRelayManager::RejectAuthenticationLocked(const char* reason) {
+    ESP_LOGW(TAG, "Rejecting current authentication without changing binding: %s", reason);
+    auth_failures_++;
     auth_started_time_us_ = 0;
-    GeneratePairCodeLocked();
-    SaveBindingLocked();
-    UpdateState(RelayLinkState::kPairing);
-
     if (conn_handle_ != 0xFFFF) {
-        SendCurrentHandshakeLocked();
-    } else {
-        StartAdvertisingLocked();
+        ble_gap_terminate(conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
     }
+    UpdateState(RelayLinkState::kError);
 }
 
 void BleRelayManager::StartAdvertisingLocked() {
@@ -577,12 +568,8 @@ void BleRelayManager::HandleAuthResponse(const std::string& json) {
     }
 
     bool accepted = false;
-    bool fallback_to_pairing = false;
-    std::string fallback_reason;
     std::function<void()> ready_cb;
     std::function<void()> disconnect_cb;
-    std::function<void(const std::string&)> pairing_code_cb;
-    std::string pair_code;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const std::string expected = ComputeProof(nonce->valuestring);
@@ -593,13 +580,8 @@ void BleRelayManager::HandleAuthResponse(const std::string& json) {
             UpdateState(RelayLinkState::kConnected);
             ready_cb = ready_callback_;
         } else {
-            auth_failures_++;
             disconnect_cb = disconnect_callback_;
-            fallback_to_pairing = true;
-            fallback_reason = "auth response rejected";
-            FallbackToPairingLocked(fallback_reason.c_str());
-            pairing_code_cb = pairing_code_callback_;
-            pair_code = pair_code_;
+            RejectAuthenticationLocked("auth response rejected");
         }
     }
 
@@ -626,9 +608,6 @@ void BleRelayManager::HandleAuthResponse(const std::string& json) {
 
     if (disconnect_cb) {
         disconnect_cb();
-    }
-    if (fallback_to_pairing && pairing_code_cb && !pair_code.empty()) {
-        pairing_code_cb(pair_code);
     }
 }
 
@@ -728,8 +707,14 @@ bool BleRelayManager::SendFragmentsLocked(BleRelayFrameType type, uint16_t strea
         return false;
     }
 
-    const size_t mtu_payload = std::min(static_cast<size_t>(kBleRelayFramePayloadMax),
-        static_cast<size_t>(std::max(20, mtu_ - 3 - static_cast<int>(sizeof(BleRelayFrameHeader)))));
+    const int negotiated_payload = mtu_ - 3 - static_cast<int>(sizeof(BleRelayFrameHeader));
+    if (negotiated_payload <= 0) {
+        ESP_LOGE(TAG, "Negotiated MTU %u cannot fit a relay frame", static_cast<unsigned>(mtu_));
+        return false;
+    }
+    const size_t mtu_payload = std::min(
+        static_cast<size_t>(kBleRelayFramePayloadMax),
+        static_cast<size_t>(negotiated_payload));
 
     if (len == 0) {
         auto frame = BleRelayBuildFrame(type, flags | kBleRelayFlagFinal, stream_id, next_seq_++, nullptr, 0);
@@ -885,9 +870,7 @@ void BleRelayManager::GattRegister(ble_gatt_register_ctxt* ctxt, void* arg) {
 void BleRelayManager::HeartbeatTimer(void* arg) {
     auto* relay = static_cast<BleRelayManager*>(arg);
     std::function<void()> disconnect_cb;
-    std::function<void(const std::string&)> pairing_code_cb;
-    std::string pair_code;
-    bool fallback_to_pairing = false;
+    bool authentication_rejected = false;
 
     {
         std::lock_guard<std::mutex> lock(relay->mutex_);
@@ -899,12 +882,11 @@ void BleRelayManager::HeartbeatTimer(void* arg) {
         if (relay->state_ == RelayLinkState::kAuthenticating &&
             relay->auth_started_time_us_ != 0 &&
             now - relay->auth_started_time_us_ > 10000000) {
-            relay->FallbackToPairingLocked("authentication timeout");
-            pairing_code_cb = relay->pairing_code_callback_;
-            pair_code = relay->pair_code_;
-            fallback_to_pairing = true;
+            relay->RejectAuthenticationLocked("authentication timeout");
+            disconnect_cb = relay->disconnect_callback_;
+            authentication_rejected = true;
         }
-        if (!fallback_to_pairing && relay->last_rx_time_us_ != 0 && now - relay->last_rx_time_us_ > 15000000) {
+        if (!authentication_rejected && relay->last_rx_time_us_ != 0 && now - relay->last_rx_time_us_ > 15000000) {
             ble_gap_terminate(relay->conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
             relay->conn_handle_ = 0xFFFF;
             relay->auth_started_time_us_ = 0;
@@ -919,11 +901,10 @@ void BleRelayManager::HeartbeatTimer(void* arg) {
         }
     }
 
-    if (pairing_code_cb && !pair_code.empty()) {
-        pairing_code_cb(pair_code);
-        return;
-    }
-    if (fallback_to_pairing) {
+    if (authentication_rejected) {
+        if (disconnect_cb) {
+            disconnect_cb();
+        }
         return;
     }
     relay->SendJsonFrame(BleRelayFrameType::kHeartbeat, 0, 0, "{}");
