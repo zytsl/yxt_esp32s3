@@ -13,7 +13,10 @@
 #include <host/ble_gatt.h>
 #include <host/ble_hs.h>
 #include <host/ble_hs_mbuf.h>
-#include <mbedtls/sha256.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/constant_time.h>
+#include <mbedtls/md.h>
+#include <mbedtls/platform_util.h>
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 #include <os/os_mbuf.h>
@@ -21,6 +24,8 @@
 #include <services/gatt/ble_svc_gatt.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstring>
 #include <tuple>
 
@@ -40,6 +45,88 @@ constexpr const char* kBleSecretKey = "ble_secret";
 constexpr const char* kBleBoundKey = "ble_bound";
 constexpr const char* kBleForcePairingKey = "force_ble_pair";
 uint16_t g_ble_relay_notify_val_handle = 0;
+constexpr int kBleAuthProtocolVersion = 2;
+constexpr const char* kBleAuthScheme = "hmac-sha256-v2";
+constexpr int64_t kBleAuthChallengeTtlUs = 10000000;
+
+bool IsValidAuthId(const std::string& value) {
+    if (value.empty() || value.size() > 64) return false;
+    return std::none_of(value.begin(), value.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; });
+}
+
+bool DecodeHexSecret(const std::string& value, std::vector<uint8_t>* output) {
+    if (value.size() != 32 && value.size() != 64) return false;
+    output->clear();
+    output->reserve(value.size() / 2);
+    auto nibble = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    for (size_t i = 0; i < value.size(); i += 2) {
+        int high = nibble(value[i]);
+        int low = nibble(value[i + 1]);
+        if (high < 0 || low < 0) return false;
+        output->push_back(static_cast<uint8_t>((high << 4) | low));
+    }
+    return true;
+}
+
+std::string Base64UrlEncode(const uint8_t* data, size_t size) {
+    std::vector<uint8_t> encoded(4 * ((size + 2) / 3) + 1);
+    size_t written = 0;
+    if (mbedtls_base64_encode(encoded.data(), encoded.size(), &written, data, size) != 0) return {};
+    std::string value(reinterpret_cast<char*>(encoded.data()), written);
+    std::replace(value.begin(), value.end(), '+', '-');
+    std::replace(value.begin(), value.end(), '/', '_');
+    while (!value.empty() && value.back() == '=') value.pop_back();
+    return value;
+}
+
+bool Base64UrlDecodeExact(const std::string& value, uint8_t* output, size_t expected_size) {
+    if (value.empty() || value.find('=') != std::string::npos ||
+        std::any_of(value.begin(), value.end(), [](unsigned char c) {
+            return !(std::isalnum(c) || c == '-' || c == '_');
+        })) return false;
+    std::string padded = value;
+    std::replace(padded.begin(), padded.end(), '-', '+');
+    std::replace(padded.begin(), padded.end(), '_', '/');
+    while (padded.size() % 4 != 0) padded.push_back('=');
+    size_t written = 0;
+    return mbedtls_base64_decode(output, expected_size, &written,
+        reinterpret_cast<const uint8_t*>(padded.data()), padded.size()) == 0 && written == expected_size;
+}
+
+void AppendLp16(std::vector<uint8_t>* output, const uint8_t* data, size_t size) {
+    output->push_back(static_cast<uint8_t>((size >> 8) & 0xff));
+    output->push_back(static_cast<uint8_t>(size & 0xff));
+    output->insert(output->end(), data, data + size);
+}
+
+void AppendLp16(std::vector<uint8_t>* output, const std::string& value) {
+    AppendLp16(output, reinterpret_cast<const uint8_t*>(value.data()), value.size());
+}
+
+bool ComputeAuthProofV2(const std::string& secret_hex, const std::string& peer_id,
+    const std::string& device_id, const std::string& client_id,
+    const uint8_t* session_id, const uint8_t* device_nonce, const uint8_t* app_nonce,
+    std::array<uint8_t, 32>* proof) {
+    if (!IsValidAuthId(peer_id) || !IsValidAuthId(device_id) || !IsValidAuthId(client_id)) return false;
+    std::vector<uint8_t> key;
+    if (!DecodeHexSecret(secret_hex, &key)) return false;
+    static constexpr char kDomain[] = "AnimoDollBleAuth";
+    std::vector<uint8_t> transcript(kDomain, kDomain + sizeof(kDomain) - 1);
+    transcript.push_back(kBleAuthProtocolVersion);
+    transcript.push_back(1);
+    AppendLp16(&transcript, peer_id);
+    AppendLp16(&transcript, device_id);
+    AppendLp16(&transcript, client_id);
+    AppendLp16(&transcript, session_id, 16);
+    AppendLp16(&transcript, device_nonce, 32);
+    AppendLp16(&transcript, app_nonce, 32);
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    const int rc = info == nullptr ? -1 : mbedtls_md_hmac(info, key.data(), key.size(),
+        transcript.data(), transcript.size(), proof->data());
+    mbedtls_platform_zeroize(key.data(), key.size());
+    mbedtls_platform_zeroize(transcript.data(), transcript.size());
+    return rc == 0;
+}
 
 uint32_t BuildPendingFrameKey(BleRelayFrameType type, uint16_t stream_id) {
     return (static_cast<uint32_t>(static_cast<uint8_t>(type)) << 16) | stream_id;
@@ -337,6 +424,8 @@ void BleRelayManager::RejectAuthenticationLocked(const char* reason) {
     ESP_LOGW(TAG, "Rejecting current authentication without changing binding: %s", reason);
     auth_failures_++;
     auth_started_time_us_ = 0;
+    auth_challenge_active_ = false;
+    auth_challenge_consumed_ = true;
     if (conn_handle_ != 0xFFFF) {
         ble_gap_terminate(conn_handle_, BLE_ERR_REM_USER_CONN_TERM);
     }
@@ -554,29 +643,51 @@ void BleRelayManager::HandlePairResponse(const std::string& json) {
 
 void BleRelayManager::HandleAuthResponse(const std::string& json) {
     auto* root = cJSON_Parse(json.c_str());
-    if (root == nullptr) {
-        ESP_LOGE(TAG, "Invalid auth response");
-        return;
-    }
-
-    auto* peer_id = cJSON_GetObjectItem(root, "peer_id");
-    auto* nonce = cJSON_GetObjectItem(root, "nonce");
-    auto* proof = cJSON_GetObjectItem(root, "proof");
-    if (!cJSON_IsString(peer_id) || !cJSON_IsString(nonce) || !cJSON_IsString(proof)) {
-        cJSON_Delete(root);
-        return;
-    }
-
     bool accepted = false;
     std::function<void()> ready_cb;
     std::function<void()> disconnect_cb;
+    std::string response_session;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const std::string expected = ComputeProof(nonce->valuestring);
-        accepted = bound_ && peer_id_ == peer_id->valuestring && expected == proof->valuestring;
+        const bool may_attempt = auth_challenge_active_ && !auth_challenge_consumed_;
+        auth_challenge_consumed_ = true;
+        std::array<uint8_t, 16> session{};
+        std::array<uint8_t, 32> device_nonce{};
+        std::array<uint8_t, 32> app_nonce{};
+        std::array<uint8_t, 32> received_proof{};
+        std::array<uint8_t, 32> expected_proof{};
+        auto* version = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "protocol_version");
+        auto* scheme = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "auth_scheme");
+        auto* peer_id = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "peer_id");
+        auto* session_id = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "session_id");
+        auto* nonce = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "device_nonce");
+        auto* app = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "app_nonce");
+        auto* proof = root == nullptr ? nullptr : cJSON_GetObjectItem(root, "proof");
+        const bool fields_valid = cJSON_IsNumber(version) && version->valueint == kBleAuthProtocolVersion &&
+            cJSON_IsString(scheme) && std::strcmp(scheme->valuestring, kBleAuthScheme) == 0 &&
+            cJSON_IsString(peer_id) && cJSON_IsString(session_id) && cJSON_IsString(nonce) &&
+            cJSON_IsString(app) && cJSON_IsString(proof) &&
+            Base64UrlDecodeExact(session_id->valuestring, session.data(), session.size()) &&
+            Base64UrlDecodeExact(nonce->valuestring, device_nonce.data(), device_nonce.size()) &&
+            Base64UrlDecodeExact(app->valuestring, app_nonce.data(), app_nonce.size()) &&
+            Base64UrlDecodeExact(proof->valuestring, received_proof.data(), received_proof.size());
+        const int64_t age = esp_timer_get_time() - auth_started_time_us_;
+        const bool challenge_matches = fields_valid && may_attempt && bound_ &&
+            state_ == RelayLinkState::kAuthenticating && age >= 0 && age <= kBleAuthChallengeTtlUs &&
+            peer_id_ == peer_id->valuestring &&
+            std::equal(session.begin(), session.end(), auth_session_id_.begin()) &&
+            std::equal(device_nonce.begin(), device_nonce.end(), auth_device_nonce_.begin());
+        const bool computed = challenge_matches && ComputeAuthProofV2(secret_, peer_id_, auth_device_id_,
+            auth_client_id_, auth_session_id_.data(), auth_device_nonce_.data(), app_nonce.data(), &expected_proof);
+        accepted = computed && mbedtls_ct_memcmp(expected_proof.data(), received_proof.data(), expected_proof.size()) == 0;
+        response_session = Base64UrlEncode(auth_session_id_.data(), auth_session_id_.size());
+        mbedtls_platform_zeroize(app_nonce.data(), app_nonce.size());
+        mbedtls_platform_zeroize(received_proof.data(), received_proof.size());
+        mbedtls_platform_zeroize(expected_proof.data(), expected_proof.size());
         if (accepted) {
             auth_failures_ = 0;
             auth_started_time_us_ = 0;
+            auth_challenge_active_ = false;
             UpdateState(RelayLinkState::kConnected);
             ready_cb = ready_callback_;
         } else {
@@ -587,13 +698,16 @@ void BleRelayManager::HandleAuthResponse(const std::string& json) {
 
     cJSON* response = cJSON_CreateObject();
     cJSON_AddBoolToObject(response, "ok", accepted);
+    cJSON_AddNumberToObject(response, "protocol_version", kBleAuthProtocolVersion);
+    cJSON_AddStringToObject(response, "auth_scheme", kBleAuthScheme);
+    cJSON_AddStringToObject(response, "session_id", response_session.c_str());
     char* text = cJSON_PrintUnformatted(response);
     if (text != nullptr) {
         SendJsonFrame(BleRelayFrameType::kAuthResponse, 0, accepted ? 0 : kBleRelayFlagError, text);
         cJSON_free(text);
     }
     cJSON_Delete(response);
-    cJSON_Delete(root);
+    if (root != nullptr) cJSON_Delete(root);
 
     if (accepted) {
         if (heartbeat_timer_ != nullptr) {
@@ -634,7 +748,6 @@ void BleRelayManager::SendCurrentHandshakeLocked() {
     cJSON* root = cJSON_CreateObject();
     if (!bound_ || force_pairing_) {
         ESP_LOGI(TAG, "Sending pair request to app");
-        cJSON_AddStringToObject(root, "pair_code", pair_code_.c_str());
         cJSON_AddStringToObject(root, "device_id", SystemInfo::GetMacAddress().c_str());
         cJSON_AddStringToObject(root, "client_id", Board::GetInstance().GetUuid().c_str());
         char* text = cJSON_PrintUnformatted(root);
@@ -647,13 +760,30 @@ void BleRelayManager::SendCurrentHandshakeLocked() {
             cJSON_free(text);
         }
     } else {
-        ESP_LOGI(TAG, "Sending auth request to app for peer_id=%s", peer_id_.c_str());
-        auth_started_time_us_ = esp_timer_get_time();
+        ESP_LOGI(TAG, "Sending BLE auth v2 request peer_present=%d", !peer_id_.empty());
+        if (!auth_challenge_active_) {
+            esp_fill_random(auth_session_id_.data(), auth_session_id_.size());
+            esp_fill_random(auth_device_nonce_.data(), auth_device_nonce_.size());
+            auth_device_id_ = SystemInfo::GetMacAddress();
+            auth_client_id_ = Board::GetInstance().GetUuid();
+            auth_started_time_us_ = esp_timer_get_time();
+            auth_challenge_active_ = true;
+            auth_challenge_consumed_ = false;
+        }
         if (heartbeat_timer_ != nullptr) {
             esp_timer_stop(heartbeat_timer_);
             esp_timer_start_periodic(heartbeat_timer_, 5000000);
         }
+        cJSON_AddNumberToObject(root, "protocol_version", kBleAuthProtocolVersion);
+        cJSON_AddStringToObject(root, "auth_scheme", kBleAuthScheme);
         cJSON_AddStringToObject(root, "peer_id", peer_id_.c_str());
+        cJSON_AddStringToObject(root, "device_id", auth_device_id_.c_str());
+        cJSON_AddStringToObject(root, "client_id", auth_client_id_.c_str());
+        const std::string session_id = Base64UrlEncode(auth_session_id_.data(), auth_session_id_.size());
+        const std::string device_nonce = Base64UrlEncode(auth_device_nonce_.data(), auth_device_nonce_.size());
+        cJSON_AddStringToObject(root, "session_id", session_id.c_str());
+        cJSON_AddStringToObject(root, "device_nonce", device_nonce.c_str());
+        cJSON_AddNumberToObject(root, "challenge_ttl_ms", kBleAuthChallengeTtlUs / 1000);
         char* text = cJSON_PrintUnformatted(root);
         if (text != nullptr) {
             if (!SendFragmentsLocked(BleRelayFrameType::kAuthRequest, 0, 0,
@@ -686,20 +816,6 @@ std::string BleRelayManager::GenerateSecretLocked() {
         secret.push_back(kHex[byte & 0x0F]);
     }
     return secret;
-}
-
-std::string BleRelayManager::ComputeProof(const std::string& nonce) const {
-    std::string material = secret_ + ":" + nonce;
-    uint8_t digest[32];
-    mbedtls_sha256(reinterpret_cast<const unsigned char*>(material.data()), material.size(), digest, 0);
-    static const char* kHex = "0123456789abcdef";
-    std::string proof;
-    proof.reserve(sizeof(digest) * 2);
-    for (uint8_t byte : digest) {
-        proof.push_back(kHex[(byte >> 4) & 0x0F]);
-        proof.push_back(kHex[byte & 0x0F]);
-    }
-    return proof;
 }
 
 bool BleRelayManager::SendFragmentsLocked(BleRelayFrameType type, uint16_t stream_id, uint8_t flags, const uint8_t* data, size_t len) {
@@ -762,6 +878,8 @@ int BleRelayManager::GapEvent(ble_gap_event* event, void* arg) {
                 relay->auth_failures_ = 0;
                 relay->last_rx_time_us_ = esp_timer_get_time();
                 relay->auth_started_time_us_ = 0;
+                relay->auth_challenge_active_ = false;
+                relay->auth_challenge_consumed_ = false;
                 relay->UpdateState(relay->bound_ && !relay->force_pairing_ ? RelayLinkState::kAuthenticating : RelayLinkState::kPairing);
                 if (!relay->bound_ || relay->force_pairing_) {
                     pairing_code_cb = relay->pairing_code_callback_;
@@ -778,6 +896,8 @@ int BleRelayManager::GapEvent(ble_gap_event* event, void* arg) {
             relay->conn_handle_ = 0xFFFF;
             relay->mtu_ = 23;
             relay->auth_started_time_us_ = 0;
+            relay->auth_challenge_active_ = false;
+            relay->auth_challenge_consumed_ = false;
             relay->UpdateState(RelayLinkState::kDisconnected);
             relay->NotifyHandlersDisconnectedLocked();
             disconnect_cb = relay->disconnect_callback_;
@@ -880,8 +1000,8 @@ void BleRelayManager::HeartbeatTimer(void* arg) {
 
         const int64_t now = esp_timer_get_time();
         if (relay->state_ == RelayLinkState::kAuthenticating &&
-            relay->auth_started_time_us_ != 0 &&
-            now - relay->auth_started_time_us_ > 10000000) {
+            relay->auth_challenge_active_ && relay->auth_started_time_us_ != 0 &&
+            now - relay->auth_started_time_us_ > kBleAuthChallengeTtlUs) {
             relay->RejectAuthenticationLocked("authentication timeout");
             disconnect_cb = relay->disconnect_callback_;
             authentication_rejected = true;

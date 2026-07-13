@@ -7,6 +7,7 @@
 #include <host/ble_uuid.h>
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -74,7 +75,6 @@ private:
     void RejectAuthenticationLocked(const char* reason);
     std::string GeneratePairCodeLocked();
     std::string GenerateSecretLocked();
-    std::string ComputeProof(const std::string& nonce) const;
     bool SendFragmentsLocked(BleRelayFrameType type, uint16_t stream_id, uint8_t flags, const uint8_t* data, size_t len);
 
     static void HostTask(void* param);
@@ -102,6 +102,12 @@ private:
     int auth_failures_ = 0;
     int64_t last_rx_time_us_ = 0;
     int64_t auth_started_time_us_ = 0;
+    bool auth_challenge_active_ = false;
+    bool auth_challenge_consumed_ = false;
+    std::array<uint8_t, 16> auth_session_id_{};
+    std::array<uint8_t, 32> auth_device_nonce_{};
+    std::string auth_device_id_;
+    std::string auth_client_id_;
     std::string pair_code_;
     std::string peer_id_;
     std::string secret_;

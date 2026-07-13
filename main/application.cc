@@ -1085,8 +1085,8 @@ void Application::ShowPairCode(const std::string& code, const std::string& messa
     display->SetChatMessage("system", message.c_str());
 
     auto codec = Board::GetInstance().GetAudioCodec();
-    ESP_LOGI(TAG, "ShowPairCode code=%s output_enabled=%s output_volume=%d",
-        code.c_str(), codec->output_enabled() ? "true" : "false", codec->output_volume());
+    ESP_LOGI(TAG, "ShowPairCode digits_present=%s output_enabled=%s output_volume=%d",
+        code.empty() ? "false" : "true", codec->output_enabled() ? "true" : "false", codec->output_volume());
     if (!codec->output_enabled()) {
         ESP_LOGW(TAG, "Audio output was disabled before pair code playback, enabling it");
         codec->EnableOutput(true);
@@ -1097,7 +1097,6 @@ void Application::ShowPairCode(const std::string& code, const std::string& messa
         auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
             [digit](const digit_sound& ds) { return ds.digit == digit; });
         if (it != digit_sounds.end()) {
-            ESP_LOGI(TAG, "ShowPairCode playing digit=%c", digit);
             PlaySound(it->sound);
         }
     }
