@@ -232,6 +232,11 @@ void Application::Start() {
     board.StartNetwork();
 
     ota_ = std::make_unique<Ota>();
+    if (ota_->RequiresRecovery()) {
+        ESP_LOGE(TAG, "Persistent OTA security recovery flag is set; refusing normal startup");
+        display->SetStatus(Lang::Strings::UPGRADE_FAILED);
+        while (true) vTaskDelay(portMAX_DELAY);
+    }
     
     // Check for new firmware version
     display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
@@ -242,11 +247,13 @@ void Application::Start() {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    if (ota_->HasNewVersion()) {
-        UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion(), ota_->GetFirmwareSha256());
+    const bool current_image_allows_upgrade = ota_->MarkCurrentVersionValid();
+
+    if (current_image_allows_upgrade && ota_->HasNewVersion()) {
+        UpgradeFirmware(ota_->GetFirmwareManifest());
+    } else if (!current_image_allows_upgrade && ota_->HasNewVersion()) {
+        ESP_LOGE(TAG, "Skipping OTA because the running image could not be proven safe");
     }
-    
-    ota_->MarkCurrentVersionValid();
 
     // Activation
     while (ota_->HasActivationCode() || ota_->HasActivationChallenge()) {
@@ -979,12 +986,12 @@ bool Application::CanEnterSleepMode() {
     return true;
 }
 
-bool Application::UpgradeFirmware(const std::string& url, const std::string& version, const std::string& sha256) {
+bool Application::UpgradeFirmware(const OtaFirmwareManifest& manifest) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
 
-    std::string upgrade_url = url;
-    std::string version_info = version.empty() ? "(Manual upgrade)" : version;
+    const std::string& upgrade_url = manifest.url;
+    const std::string& version_info = manifest.version;
 
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         ESP_LOGI(TAG, "Closing audio channel before firmware upgrade");
@@ -1005,7 +1012,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    bool upgrade_success = Ota::Upgrade(upgrade_url, sha256, [display](int progress, size_t speed) {
+    bool upgrade_success = Ota::Upgrade(manifest, [display](int progress, size_t speed) {
         char buffer[64];
         snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
         Application::GetInstance().Schedule([display, buffer_str = std::string(buffer)]() {

@@ -9,6 +9,11 @@
 
 #define TAG "BleRelayHttp"
 
+namespace {
+constexpr size_t kMaxQueuedBodyBytes = 64 * 1024;
+constexpr size_t kMaxRelayBodyBytes = 8 * 1024 * 1024;
+}
+
 BleRelayHttp::BleRelayHttp() {
 }
 
@@ -96,7 +101,15 @@ const std::string& BleRelayHttp::GetBody() {
         while (!body_chunks_.empty()) {
             auto chunk = std::move(body_chunks_.front());
             body_chunks_.pop_front();
-            response_body_.append(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+            const size_t remaining = chunk.size() - consumed_offset_;
+            if (remaining > kMaxRelayBodyBytes - response_body_.size()) {
+                error_ = true;
+                break;
+            }
+            response_body_.append(
+                reinterpret_cast<const char*>(chunk.data() + consumed_offset_), remaining);
+            queued_body_bytes_ -= remaining;
+            consumed_offset_ = 0;
         }
     }
     return response_body_;
@@ -111,6 +124,7 @@ int BleRelayHttp::Read(char* buffer, size_t buffer_size) {
             const size_t copy_len = std::min(available, buffer_size);
             memcpy(buffer, chunk.data() + consumed_offset_, copy_len);
             consumed_offset_ += copy_len;
+            queued_body_bytes_ -= copy_len;
             if (consumed_offset_ >= chunk.size()) {
                 body_chunks_.pop_front();
                 consumed_offset_ = 0;
@@ -149,7 +163,13 @@ void BleRelayHttp::OnBleRelayFrame(BleRelayFrameType type, uint8_t flags, const 
             status_code_ = status_code->valueint;
         }
         if (cJSON_IsNumber(content_length)) {
-            body_length_ = content_length->valuedouble;
+            const double declared_length = content_length->valuedouble;
+            if (declared_length < 0 || declared_length > kMaxRelayBodyBytes ||
+                declared_length != static_cast<size_t>(declared_length)) {
+                error_ = true;
+            } else {
+                body_length_ = static_cast<size_t>(declared_length);
+            }
         }
         response_headers_.clear();
         if (cJSON_IsObject(response_headers)) {
@@ -168,7 +188,13 @@ void BleRelayHttp::OnBleRelayFrame(BleRelayFrameType type, uint8_t flags, const 
 
     if (type == BleRelayFrameType::kHttpBody) {
         if (!payload.empty()) {
-            body_chunks_.push_back(payload);
+            if (error_ || payload.size() > kMaxQueuedBodyBytes - queued_body_bytes_) {
+                error_ = true;
+                eof_ = true;
+            } else {
+                queued_body_bytes_ += payload.size();
+                body_chunks_.push_back(payload);
+            }
         }
         if ((flags & kBleRelayFlagEof) != 0) {
             eof_ = true;
@@ -194,6 +220,7 @@ void BleRelayHttp::ResetStateLocked() {
     status_code_ = 0;
     body_length_ = 0;
     consumed_offset_ = 0;
+    queued_body_bytes_ = 0;
     opened_ = false;
     headers_ready_ = false;
     eof_ = false;

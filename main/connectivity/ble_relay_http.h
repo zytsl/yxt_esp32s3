@@ -44,6 +44,7 @@ private:
     int status_code_ = 0;
     size_t body_length_ = 0;
     size_t consumed_offset_ = 0;
+    size_t queued_body_bytes_ = 0;
     int timeout_ms_ = 15000;
     bool opened_ = false;
     bool headers_ready_ = false;

@@ -14,9 +14,11 @@
 #include <host/ble_hs.h>
 #include <host/ble_hs_mbuf.h>
 #include <mbedtls/base64.h>
-#include <mbedtls/constant_time.h>
 #include <mbedtls/md.h>
 #include <mbedtls/platform_util.h>
+extern "C" {
+#include <mbedtls/constant_time.h>
+}
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 #include <os/os_mbuf.h>

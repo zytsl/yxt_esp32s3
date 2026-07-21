@@ -6,6 +6,13 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config OTA_MANIFEST_PUBLIC_KEY_BASE64
+    string "OTA manifest ECDSA public key (base64 DER)"
+    default ""
+    help
+        Base64-encoded SubjectPublicKeyInfo DER for the production OTA manifest
+        signing key. Firmware updates fail closed while this value is empty.
+
 choice WAKE_WORD_TYPE
     prompt "Wake Word Implementation Type"
     default USE_AFE_WAKE_WORD

@@ -10,14 +10,22 @@
 #include <esp_app_format.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
-#include <mbedtls/constant_time.h>
+#include <esp_system.h>
+#include <nvs.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
+extern "C" {
+#include <mbedtls/constant_time.h>
+}
 #ifdef SOC_HMAC_SUPPORTED
 #include <esp_hmac.h>
 #endif
 
 #include <cstring>
 #include <cctype>
+#include <cmath>
+#include <limits>
 #include <vector>
 #include <sstream>
 #include <algorithm>
@@ -25,10 +33,25 @@
 #define TAG "Ota"
 
 namespace {
-bool IsLowerHexSha256(const std::string& value) {
-    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-    });
+constexpr size_t kMaxOtaCheckResponseBytes = 64 * 1024;
+
+bool PersistRecoveryRequired() {
+    nvs_handle_t handle = 0;
+    esp_err_t result = nvs_open("ota_security", NVS_READWRITE, &handle);
+    if (result == ESP_OK) {
+        result = nvs_set_i32(handle, "recovery_required", 1);
+    }
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist OTA recovery requirement: %s", esp_err_to_name(result));
+        return false;
+    }
+    return true;
 }
 
 bool DecodeSha256(const std::string& value, uint8_t output[32]) {
@@ -40,22 +63,81 @@ bool DecodeSha256(const std::string& value, uint8_t output[32]) {
     return true;
 }
 
-bool IsTrustedOtaUrl(const std::string& firmware_url) {
-    if (firmware_url.rfind("https://", 0) != 0) return false;
-    const size_t authority_start = 8;
-    const size_t authority_end = firmware_url.find('/', authority_start);
-    std::string host = firmware_url.substr(authority_start, authority_end - authority_start);
-    if (host.empty() || host.find('@') != std::string::npos) return false;
-    const size_t port = host.find(':');
-    if (port != std::string::npos) host.resize(port);
-    std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) { return std::tolower(c); });
-    return host == "animodoll.com" ||
-        (host.size() > 14 && host.compare(host.size() - 14, 14, ".animodoll.com") == 0);
+bool DecodeBase64(const std::string& value, size_t max_decoded_size, std::vector<uint8_t>* output) {
+    if (value.empty() || value.size() > max_decoded_size * 2) return false;
+    output->assign(max_decoded_size, 0);
+    size_t decoded_size = 0;
+    if (mbedtls_base64_decode(output->data(), output->size(), &decoded_size,
+            reinterpret_cast<const uint8_t*>(value.data()), value.size()) != 0 || decoded_size == 0) {
+        output->clear();
+        return false;
+    }
+    output->resize(decoded_size);
+    return true;
+}
+
+bool ReadUnsignedJson(cJSON* item, uint64_t maximum, uint64_t* output) {
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) || item->valuedouble < 0 ||
+        item->valuedouble > static_cast<double>(maximum) || std::floor(item->valuedouble) != item->valuedouble) {
+        return false;
+    }
+    *output = static_cast<uint64_t>(item->valuedouble);
+    return true;
+}
+
+bool VerifyManifestSignature(const OtaFirmwareManifest& manifest) {
+    const std::string canonical = BuildCanonicalOtaManifest(manifest);
+    const std::string public_key_base64 = CONFIG_OTA_MANIFEST_PUBLIC_KEY_BASE64;
+    if (canonical.empty() || public_key_base64.empty()) {
+        ESP_LOGE(TAG, "OTA manifest public key is not provisioned");
+        return false;
+    }
+
+    std::vector<uint8_t> public_key;
+    std::vector<uint8_t> signature;
+    if (!DecodeBase64(public_key_base64, 2048, &public_key) ||
+        !DecodeBase64(manifest.signature, 512, &signature)) {
+        ESP_LOGE(TAG, "OTA manifest key or signature is not valid base64 DER");
+        return false;
+    }
+
+    uint8_t digest[32];
+    mbedtls_sha256_context sha256;
+    mbedtls_sha256_init(&sha256);
+    const bool digest_ok = mbedtls_sha256_starts(&sha256, 0) == 0 &&
+        mbedtls_sha256_update(&sha256, reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size()) == 0 &&
+        mbedtls_sha256_finish(&sha256, digest) == 0;
+    mbedtls_sha256_free(&sha256);
+    if (!digest_ok) return false;
+
+    mbedtls_pk_context key;
+    mbedtls_pk_init(&key);
+    const bool verified = mbedtls_pk_parse_public_key(&key, public_key.data(), public_key.size()) == 0 &&
+        mbedtls_pk_can_do(&key, MBEDTLS_PK_ECDSA) &&
+        mbedtls_pk_get_bitlen(&key) == 256 &&
+        mbedtls_pk_verify(&key, MBEDTLS_MD_SHA256, digest, sizeof(digest),
+            signature.data(), signature.size()) == 0;
+    mbedtls_pk_free(&key);
+    if (!verified) ESP_LOGE(TAG, "OTA manifest signature verification failed");
+    return verified;
+}
+
+bool ManifestMatchesBuild(const OtaFirmwareManifest& manifest) {
+    const esp_app_desc_t* current = esp_app_get_description();
+    return IsOtaManifestCompatible(
+        manifest,
+        current->project_name,
+        BOARD_TYPE,
+        "esp32s3",
+        current->secure_version,
+        CONFIG_BOOTLOADER_APP_SEC_VER_SIZE_EFUSE_FIELD);
 }
 }
 
 
 Ota::Ota() {
+    Settings ota_security("ota_security", false);
+    recovery_required_ = ota_security.GetInt("recovery_required", 0) == 1;
 #ifdef ESP_EFUSE_BLOCK_USR_DATA
     // Read Serial Number from efuse user_data
     uint8_t serial_number[33] = {0};
@@ -127,7 +209,7 @@ esp_err_t Ota::CheckVersion() {
     std::string method = data.length() > 0 ? "POST" : "GET";
 
     if (data.length() > 0) {
-        ESP_LOGI(TAG, "Request payload: %s", data.c_str());
+        ESP_LOGI(TAG, "Sending OTA check metadata (%u bytes)", static_cast<unsigned>(data.size()));
     }
 
     if (!http->Open(method, url, data)) {
@@ -141,8 +223,32 @@ esp_err_t Ota::CheckVersion() {
         return ESP_FAIL;
     }
 
-    data = http->GetBody();
+    const size_t response_length = http->GetBodyLength();
+    if (response_length == 0 || response_length > kMaxOtaCheckResponseBytes) {
+        ESP_LOGE(TAG, "OTA check response length is missing or exceeds the 64 KiB limit");
+        http->Close();
+        return ESP_ERR_INVALID_SIZE;
+    }
+    data.clear();
+    data.reserve(response_length);
+    char response_buffer[512];
+    while (data.size() < response_length) {
+        const size_t remaining = response_length - data.size();
+        const int read = http->Read(response_buffer, std::min(sizeof(response_buffer), remaining));
+        if (read <= 0) {
+            http->Close();
+            ESP_LOGE(TAG, "OTA check response ended before Content-Length");
+            return ESP_ERR_INVALID_SIZE;
+        }
+        data.append(response_buffer, static_cast<size_t>(read));
+    }
+    char overflow_probe = 0;
+    const int overflow_read = http->Read(&overflow_probe, 1);
     http->Close();
+    if (overflow_read != 0 || data.size() != response_length || data.size() > kMaxOtaCheckResponseBytes) {
+        ESP_LOGE(TAG, "OTA check response body length does not match Content-Length");
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     // Response: { "firmware": { "version": "1.0.0", "url": "http://" } }
     // Parse the JSON response and check if the version is newer
@@ -248,30 +354,55 @@ esp_err_t Ota::CheckVersion() {
     has_new_version_ = false;
     cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
     if (cJSON_IsObject(firmware)) {
+        OtaFirmwareManifest candidate;
+        cJSON *schema_version = cJSON_GetObjectItem(firmware, "schema_version");
         cJSON *version = cJSON_GetObjectItem(firmware, "version");
-        if (cJSON_IsString(version)) {
-            firmware_version_ = version->valuestring;
-        }
         cJSON *url = cJSON_GetObjectItem(firmware, "url");
-        if (cJSON_IsString(url)) {
-            firmware_url_ = url->valuestring;
-        }
         cJSON *sha256 = cJSON_GetObjectItem(firmware, "sha256");
-        if (cJSON_IsString(sha256)) {
-            firmware_sha256_ = sha256->valuestring;
+        cJSON *size = cJSON_GetObjectItem(firmware, "size");
+        cJSON *project_name = cJSON_GetObjectItem(firmware, "project_name");
+        cJSON *board_type = cJSON_GetObjectItem(firmware, "board_type");
+        cJSON *chip_id = cJSON_GetObjectItem(firmware, "chip_id");
+        cJSON *secure_version = cJSON_GetObjectItem(firmware, "secure_version");
+        cJSON *signature = cJSON_GetObjectItem(firmware, "signature");
+        uint64_t parsed_size = 0;
+        uint64_t parsed_schema_version = 0;
+        uint64_t parsed_secure_version = 0;
+        const bool complete = cJSON_IsString(version) && cJSON_IsString(url) &&
+            cJSON_IsString(sha256) && cJSON_IsString(project_name) &&
+            cJSON_IsString(board_type) && cJSON_IsString(chip_id) &&
+            cJSON_IsString(signature) &&
+            ReadUnsignedJson(schema_version, 1, &parsed_schema_version) && parsed_schema_version == 1 &&
+            ReadUnsignedJson(size, std::numeric_limits<size_t>::max(), &parsed_size) &&
+            ReadUnsignedJson(secure_version, std::numeric_limits<uint32_t>::max(), &parsed_secure_version);
+        if (complete) {
+            candidate.schema_version = static_cast<uint32_t>(parsed_schema_version);
+            candidate.version = version->valuestring;
+            candidate.url = url->valuestring;
+            candidate.sha256 = sha256->valuestring;
+            candidate.size = parsed_size;
+            candidate.project_name = project_name->valuestring;
+            candidate.board_type = board_type->valuestring;
+            candidate.chip_id = chip_id->valuestring;
+            candidate.secure_version = static_cast<uint32_t>(parsed_secure_version);
+            candidate.signature = signature->valuestring;
         }
 
-        if (cJSON_IsString(version) && cJSON_IsString(url) && cJSON_IsString(sha256) &&
-            IsLowerHexSha256(firmware_sha256_) && IsTrustedOtaUrl(firmware_url_)) {
-            // Check if the version is newer, for example, 0.1.0 is newer than 0.0.1
-            has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
+        const esp_partition_t* update_partition = esp_ota_get_next_update_partition(nullptr);
+        const bool fits_partition = update_partition != nullptr && candidate.size <= update_partition->size;
+        if (complete && IsValidOtaManifestShape(candidate) && fits_partition &&
+            ManifestMatchesBuild(candidate) && VerifyManifestSignature(candidate)) {
+            has_new_version_ = IsNewVersionAvailable(current_version_, candidate.version);
             if (has_new_version_) {
-                ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
+                firmware_manifest_ = std::move(candidate);
+                ESP_LOGI(TAG, "Verified new firmware manifest: version=%s size=%llu",
+                    firmware_manifest_.version.c_str(),
+                    static_cast<unsigned long long>(firmware_manifest_.size));
             } else {
-                ESP_LOGI(TAG, "Current is the latest version");
+                ESP_LOGI(TAG, "Signed firmware manifest is not newer than the running version");
             }
-        } else if (cJSON_IsString(version) || cJSON_IsString(url) || cJSON_IsString(sha256)) {
-            ESP_LOGE(TAG, "Rejecting incomplete or untrusted firmware manifest");
+        } else {
+            ESP_LOGE(TAG, "Rejecting incomplete, unsigned, incompatible, or oversized firmware manifest");
         }
     } else {
         ESP_LOGW(TAG, "No firmware section found!");
@@ -281,38 +412,68 @@ esp_err_t Ota::CheckVersion() {
     return ESP_OK;
 }
 
-void Ota::MarkCurrentVersionValid() {
+bool Ota::MarkCurrentVersionValid() {
     auto partition = esp_ota_get_running_partition();
+    if (partition == nullptr) {
+        ESP_LOGE(TAG, "Failed to identify running OTA partition; blocking upgrade");
+        return false;
+    }
     if (strcmp(partition->label, "factory") == 0) {
         ESP_LOGI(TAG, "Running from factory partition, skipping");
-        return;
+        return true;
     }
 
     ESP_LOGI(TAG, "Running partition: %s", partition->label);
     esp_ota_img_states_t state;
-    if (esp_ota_get_state_partition(partition, &state) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get state of partition");
-        return;
+    const esp_err_t state_result = esp_ota_get_state_partition(partition, &state);
+    if (state_result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get state of partition: %s; blocking upgrade",
+            esp_err_to_name(state_result));
+        return false;
     }
 
     if (state == ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGI(TAG, "Marking firmware as valid");
-        esp_ota_mark_app_valid_cancel_rollback();
+        const esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to finalize OTA anti-rollback state: %s", esp_err_to_name(result));
+            const esp_err_t rollback_result = esp_ota_mark_app_invalid_rollback_and_reboot();
+            ESP_LOGE(TAG, "Failed to roll back invalid OTA image: %s", esp_err_to_name(rollback_result));
+            PersistRecoveryRequired();
+            recovery_required_ = true;
+            ESP_LOGE(TAG, "OTA security recovery is required; halting normal startup");
+            while (true) vTaskDelay(portMAX_DELAY);
+        }
+        return true;
     }
+
+    if (state == ESP_OTA_IMG_VALID) {
+        return true;
+    }
+
+    ESP_LOGE(TAG, "Running OTA partition is not verified (state=%d); blocking upgrade",
+        static_cast<int>(state));
+    return false;
 }
 
-bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_sha256,
+bool Ota::Upgrade(const OtaFirmwareManifest& manifest,
     std::function<void(int progress, size_t speed)> callback) {
-    ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
+    ESP_LOGI(TAG, "Upgrading firmware version %s", manifest.version.c_str());
     uint8_t expected_digest[32];
-    if (!IsTrustedOtaUrl(firmware_url) || !DecodeSha256(expected_sha256, expected_digest)) {
-        ESP_LOGE(TAG, "Rejecting OTA with untrusted URL or missing SHA-256 manifest digest");
+    if (!IsValidOtaManifestShape(manifest) || !ManifestMatchesBuild(manifest) ||
+        !VerifyManifestSignature(manifest) || !DecodeSha256(manifest.sha256, expected_digest) ||
+        !IsNewVersionAvailable(esp_app_get_description()->version, manifest.version)) {
+        ESP_LOGE(TAG, "Rejecting untrusted, incompatible, or non-upgrade OTA manifest");
         return false;
     }
     esp_ota_handle_t update_handle = 0;
     auto update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
         ESP_LOGE(TAG, "Failed to get update partition");
+        return false;
+    }
+    if (manifest.size > update_partition->size) {
+        ESP_LOGE(TAG, "Firmware manifest size exceeds OTA partition");
         return false;
     }
 
@@ -322,7 +483,7 @@ bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_s
     std::string image_header;
 
     auto http = Board::GetInstance().CreateHttp();
-    if (!http->Open("GET", firmware_url)) {
+    if (!http->Open("GET", manifest.url)) {
         ESP_LOGE(TAG, "Failed to open HTTP connection");
         return false;
     }
@@ -334,8 +495,8 @@ bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_s
     }
 
     size_t content_length = http->GetBodyLength();
-    if (content_length == 0) {
-        ESP_LOGE(TAG, "Failed to get content length");
+    if (content_length == 0 || content_length != manifest.size) {
+        ESP_LOGE(TAG, "Firmware Content-Length does not match signed manifest");
         http->Close();
         return false;
     }
@@ -358,6 +519,15 @@ bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_s
             if (ota_started) {
                 esp_ota_abort(update_handle);
             }
+            mbedtls_sha256_free(&sha256_context);
+            http->Close();
+            return false;
+        }
+
+        if (ret > 0 && (total_read > content_length ||
+                static_cast<size_t>(ret) > content_length - total_read)) {
+            ESP_LOGE(TAG, "Firmware response exceeds signed manifest size");
+            if (ota_started) esp_ota_abort(update_handle);
             mbedtls_sha256_free(&sha256_context);
             http->Close();
             return false;
@@ -386,7 +556,6 @@ bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_s
             http->Close();
             return false;
         }
-
         if (!image_header_checked) {
             image_header.append(buffer, ret);
             const size_t required_header_size =
@@ -397,6 +566,34 @@ bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_s
 
             esp_app_desc_t new_app_info;
             memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
+
+            esp_image_header_t new_image_header;
+            memcpy(&new_image_header, image_header.data(), sizeof(new_image_header));
+            const std::string image_project(
+                new_app_info.project_name,
+                strnlen(new_app_info.project_name, sizeof(new_app_info.project_name)));
+            const std::string image_version(
+                new_app_info.version,
+                strnlen(new_app_info.version, sizeof(new_app_info.version)));
+            const bool image_identity_matches = new_image_header.magic == ESP_IMAGE_HEADER_MAGIC &&
+#if CONFIG_IDF_TARGET_ESP32S3
+                new_image_header.chip_id == ESP_CHIP_ID_ESP32S3 &&
+#endif
+                image_project == manifest.project_name &&
+                image_version == manifest.version &&
+                new_app_info.secure_version == manifest.secure_version;
+#if CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
+            const bool secure_version_allowed = esp_efuse_check_secure_version(new_app_info.secure_version);
+#else
+            const bool secure_version_allowed =
+                new_app_info.secure_version >= esp_app_get_description()->secure_version;
+#endif
+            if (!image_identity_matches || !secure_version_allowed) {
+                ESP_LOGE(TAG, "Firmware image identity or secure version does not match signed manifest");
+                mbedtls_sha256_free(&sha256_context);
+                http->Close();
+                return false;
+            }
 
             auto current_version = esp_app_get_description()->version;
             ESP_LOGI(TAG, "Current version: %s, New version: %s", current_version, new_app_info.version);
@@ -476,7 +673,7 @@ bool Ota::Upgrade(const std::string& firmware_url, const std::string& expected_s
 }
 
 bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback) {
-    return Upgrade(firmware_url_, firmware_sha256_, callback);
+    return Upgrade(firmware_manifest_, callback);
 }
 
 
@@ -484,27 +681,33 @@ std::vector<int> Ota::ParseVersion(const std::string& version) {
     std::vector<int> versionNumbers;
     std::stringstream ss(version);
     std::string segment;
-    
+
     while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+        if (segment.empty() || versionNumbers.size() >= 4 ||
+            !std::all_of(segment.begin(), segment.end(), [](unsigned char c) { return std::isdigit(c); }) ||
+            segment.size() > 6) {
+            return {};
+        }
+        int value = 0;
+        for (char c : segment) value = value * 10 + (c - '0');
+        versionNumbers.push_back(value);
     }
-    
+
     return versionNumbers;
 }
 
 bool Ota::IsNewVersionAvailable(const std::string& currentVersion, const std::string& newVersion) {
     std::vector<int> current = ParseVersion(currentVersion);
     std::vector<int> newer = ParseVersion(newVersion);
-    
-    for (size_t i = 0; i < std::min(current.size(), newer.size()); ++i) {
-        if (newer[i] > current[i]) {
-            return true;
-        } else if (newer[i] < current[i]) {
-            return false;
-        }
+    if (current.empty() || newer.empty()) return false;
+
+    const size_t segment_count = std::max(current.size(), newer.size());
+    for (size_t i = 0; i < segment_count; ++i) {
+        const int current_value = i < current.size() ? current[i] : 0;
+        const int newer_value = i < newer.size() ? newer[i] : 0;
+        if (newer_value != current_value) return newer_value > current_value;
     }
-    
-    return newer.size() > current.size();
+    return false;
 }
 
 std::string Ota::GetActivationPayload() {
@@ -540,7 +743,6 @@ std::string Ota::GetActivationPayload() {
     cJSON_free(json_str);
     cJSON_Delete(payload);
 
-    ESP_LOGI(TAG, "Activation payload: %s", json.c_str());
     return json;
 }
 
@@ -555,6 +757,10 @@ esp_err_t Ota::Activate() {
         url += "/activate";
     } else {
         url += "activate";
+    }
+    if (!IsTrustedOtaUrl(url)) {
+        ESP_LOGE(TAG, "Activation URL is not on the production HTTPS allowlist");
+        return ESP_ERR_INVALID_ARG;
     }
 
     auto http = SetupHttp();
@@ -571,7 +777,7 @@ esp_err_t Ota::Activate() {
         return ESP_ERR_TIMEOUT;
     }
     if (status_code != 200) {
-        ESP_LOGE(TAG, "Failed to activate, code: %d, body: %s", status_code, http->GetBody().c_str());
+        ESP_LOGE(TAG, "Failed to activate, code: %d", status_code);
         return ESP_FAIL;
     }
 
