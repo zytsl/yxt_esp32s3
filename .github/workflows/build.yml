@@ -30,6 +30,13 @@ jobs:
           ./ota_manifest_test
           python tests/verify_ota_manifest_vector.py
 
+      - name: Verify BLE relay frame bounds
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I main tests/ble_relay_protocol_test.cc -o ble_relay_protocol_test
+          ./ble_relay_protocol_test
+          python tests/verify_ble_security_profile.py
+          python tests/verify_production_security.py
+
       - name: Espressif IoT Development Framework (ESP-IDF)
         # You may pin to the exact commit or the version.
         # uses: espressif/esp-idf-ci-action@8cd22ae10042fadc37890e81e9988a9113e7b506
@@ -44,4 +51,46 @@ jobs:
           command: idf.py -B build-${{ matrix.board }} -D SDKCONFIG="build-${{ matrix.board }}/sdkconfig" -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;${{ matrix.defaults }}" build
           # Command to run inside the docker container (default: builds the project)
           # command: # optional, default is idf.py build
+
+      - name: Verify resolved BLE security configuration
+        run: python tests/verify_ble_security_profile.py build-${{ matrix.board }}/sdkconfig
+
+  production-build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: bread
+            defaults: ci/sdkconfig.production.bread
+          - board: movecall
+            defaults: ci/sdkconfig.production.movecall
+    env:
+      OTA_MANIFEST_PUBLIC_KEY_BASE64: ${{ secrets.OTA_MANIFEST_PUBLIC_KEY_BASE64 }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Materialize protected OTA public-key overlay
+        shell: bash
+        run: |
+          test -n "$OTA_MANIFEST_PUBLIC_KEY_BASE64"
+          test "$(printf '%s' "$OTA_MANIFEST_PUBLIC_KEY_BASE64" | wc -c)" -le 2048
+          printf 'CONFIG_OTA_MANIFEST_PUBLIC_KEY_BASE64="%s"\n' \
+            "$OTA_MANIFEST_PUBLIC_KEY_BASE64" > ci/sdkconfig.ota-public-key
+
+      - name: Fresh production build
+        uses: espressif/esp-idf-ci-action@8cd22ae10042fadc37890e81e9988a9113e7b506
+        with:
+          esp_idf_version: v5.5.2
+          target: esp32s3
+          command: idf.py -B build-production-${{ matrix.board }} -D SDKCONFIG="build-production-${{ matrix.board }}/sdkconfig" -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;ci/sdkconfig.production;${{ matrix.defaults }};ci/sdkconfig.ota-public-key" build
+
+      - name: Verify resolved production configuration
+        run: |
+          python tests/verify_ble_security_profile.py build-production-${{ matrix.board }}/sdkconfig
+          python tests/verify_production_security.py build-production-${{ matrix.board }}/sdkconfig
                 

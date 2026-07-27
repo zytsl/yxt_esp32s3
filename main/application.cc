@@ -799,7 +799,10 @@ void Application::NotifyBleRelayDeviceState() {
     char* text = cJSON_PrintUnformatted(root);
     if (text != nullptr) {
         ESP_LOGI(TAG, "Publishing BLE device state: state=%s ready=%s battery=%d", STATE_STRINGS[device_state_], ready ? "true" : "false", battery_level);
-        relay.SendJsonFrame(BleRelayFrameType::kSocketEvent, 0, 0, text);
+        const auto type = relay.IsTransportV2()
+            ? BleRelayFrameType::kHeartbeat
+            : BleRelayFrameType::kSocketEvent;
+        relay.SendJsonFrame(type, 0, 0, text);
         cJSON_free(text);
     }
     cJSON_Delete(root);

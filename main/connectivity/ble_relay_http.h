@@ -27,14 +27,17 @@ public:
     int Read(char* buffer, size_t buffer_size) override;
     void SetTimeout(int timeout_ms) override;
 
-    void OnBleRelayFrame(BleRelayFrameType type, uint8_t flags, const std::vector<uint8_t>& payload) override;
+    bool OnBleRelayFrame(BleRelayFrameType type, uint8_t flags, const std::vector<uint8_t>& payload) override;
     void OnBleRelayDisconnected() override;
+    uint8_t AvailableReceiveCredit() const override;
 
 private:
     void ResetStateLocked();
     bool WaitForHeadersLocked(std::unique_lock<std::mutex>& lock);
     bool WaitForDataLocked(std::unique_lock<std::mutex>& lock);
 
+    std::mutex open_call_mutex_;
+    std::mutex operation_mutex_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::map<std::string, std::string> headers_;
@@ -45,11 +48,15 @@ private:
     size_t body_length_ = 0;
     size_t consumed_offset_ = 0;
     size_t queued_body_bytes_ = 0;
+    size_t received_body_bytes_ = 0;
     int timeout_ms_ = 15000;
     bool opened_ = false;
+    bool opening_ = false;
+    uint64_t operation_generation_ = 0;
     bool headers_ready_ = false;
     bool eof_ = false;
     bool error_ = false;
+    uint32_t active_request_id_ = 0;
 };
 
 #endif
