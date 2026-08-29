@@ -52,6 +52,10 @@ constexpr const char* kBleSecretKey = "ble_secret";
 constexpr const char* kBleBoundKey = "ble_bound";
 constexpr const char* kBleForcePairingKey = "force_ble_pair";
 constexpr const char* kBleTransportFloorKey = "ble_tx_floor";
+// 用户自定义设备名（昵称）：广播名固定为 "<XiaoTun>-<custom>"，保留前缀供 App 扫描过滤。
+constexpr const char* kBleCustomNameKey = "ble_custom_name";
+// 扫描响应包名字段上限 29 字节，扣除前缀 "XiaoTun-" 后的安全上限。
+constexpr size_t kMaxCustomNameBytes = 18;
 uint16_t g_ble_relay_notify_val_handle = 0;
 constexpr int kBleAuthProtocolVersion = 2;
 constexpr const char* kBleAuthScheme = "hmac-sha256-v2";
@@ -72,6 +76,12 @@ constexpr size_t kBleTransportRouteTombstonesMax = 64;
 
 bool IsValidAuthId(const std::string& value) {
     if (value.empty() || value.size() > 64) return false;
+    return std::none_of(value.begin(), value.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; });
+}
+
+// 自定义设备名：UTF-8 可见字符，不允许控制字符与 NUL（高位字节 ≥0x80 为 UTF-8 续字节，放行）。
+bool IsValidCustomName(const std::string& value) {
+    if (value.empty() || value.size() > kMaxCustomNameBytes) return false;
     return std::none_of(value.begin(), value.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; });
 }
 
@@ -291,6 +301,8 @@ ble_uuid128_t BleRelayManager::app_to_device_uuid_ =
     BLE_UUID128_INIT(0x52, 0x4b, 0x2d, 0xe8, 0xb4, 0x7f, 0x58, 0x9a, 0x6f, 0x4c, 0x2d, 0xb1, 0x0d, 0x6f, 0x2e, 0x7b);
 ble_uuid128_t BleRelayManager::device_to_app_uuid_ =
     BLE_UUID128_INIT(0x53, 0x4b, 0x2d, 0xe8, 0xb4, 0x7f, 0x58, 0x9a, 0x6f, 0x4c, 0x2d, 0xb1, 0x0e, 0x6f, 0x2e, 0x7b);
+ble_uuid128_t BleRelayManager::device_name_uuid_ =
+    BLE_UUID128_INIT(0x54, 0x4b, 0x2d, 0xe8, 0xb4, 0x7f, 0x58, 0x9a, 0x6f, 0x4c, 0x2d, 0xb1, 0x0f, 0x6f, 0x2e, 0x7b);
 
 BleRelayManager& BleRelayManager::GetInstance() {
     static BleRelayManager instance;
@@ -360,6 +372,11 @@ void BleRelayManager::EnsureInitialized() {
             .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN,
             .val_handle = &g_ble_relay_notify_val_handle,
         },
+        {
+            .uuid = &BleRelayManager::device_name_uuid_.u,
+            .access_cb = BleRelayManager::GattAccessDeviceName,
+            .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_AUTHEN,
+        },
         { 0 }
     };
     static ble_gatt_svc_def gatt_svcs[] = {
@@ -385,7 +402,11 @@ void BleRelayManager::EnsureInitialized() {
     }
     notify_val_handle_ = 0;
 
-    std::string device_name = std::string(CONFIG_BLE_RELAY_DEVICE_NAME_PREFIX) + "-" + SystemInfo::GetMacAddress().substr(12);
+    if (!IsValidCustomName(custom_name_)) {
+        custom_name_.clear();
+    }
+    std::string device_name = std::string(CONFIG_BLE_RELAY_DEVICE_NAME_PREFIX) + "-" +
+        (custom_name_.empty() ? SystemInfo::GetMacAddress().substr(12) : custom_name_);
     rc = ble_svc_gap_device_name_set(device_name.c_str());
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_svc_gap_device_name_set failed: %d", rc);
@@ -698,6 +719,7 @@ void BleRelayManager::LoadStateFromNvs() {
     transport_floor_ = static_cast<uint8_t>(std::max<int32_t>(1, settings.GetInt(kBleTransportFloorKey, 1)));
     peer_id_ = settings.GetString(kBlePeerIdKey);
     secret_ = settings.GetString(kBleSecretKey);
+    custom_name_ = settings.GetString(kBleCustomNameKey);
 }
 
 void BleRelayManager::SaveBindingLocked() {
@@ -2338,6 +2360,76 @@ int BleRelayManager::GattAccessWrite(uint16_t conn_handle, uint16_t attr_handle,
     }
     GetInstance().HandleIncomingData(data.data(), data.size());
     return 0;
+}
+
+// 设备名配置特征：读返回 {name,custom,mac}；写为 UTF-8 昵称（≤18 字节），
+// 固件保存 NVS 并以 "<XiaoTun>-<昵称>" 重设 GAP 设备名。写需要加密链路（WRITE_AUTHEN），
+// 防止路人对公共场合的玩偶恶意改名；读保持开放（名字与 MAC 本就随广播可见）。
+int BleRelayManager::GattAccessDeviceName(uint16_t conn_handle, uint16_t attr_handle, ble_gatt_access_ctxt* ctxt, void* arg) {
+    auto& relay = GetInstance();
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        std::string custom;
+        {
+            std::lock_guard<std::mutex> lock(relay.mutex_);
+            custom = relay.custom_name_;
+        }
+        const std::string full = std::string(CONFIG_BLE_RELAY_DEVICE_NAME_PREFIX) + "-" +
+            (custom.empty() ? SystemInfo::GetMacAddress().substr(12) : custom);
+        cJSON* root = cJSON_CreateObject();
+        if (root == nullptr) {
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        AddJsonString(root, "name", full);
+        AddJsonString(root, "custom", custom);
+        AddJsonString(root, "mac", SystemInfo::GetMacAddress());
+        char* json = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (json == nullptr) {
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        const int rc = os_mbuf_append(ctxt->om, json, strlen(json));
+        cJSON_free(json);
+        return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        const uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len == 0 || len > kMaxCustomNameBytes) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        std::string value(len, '\0');
+        const int rc = os_mbuf_copydata(ctxt->om, 0, len, value.data());
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to copy device-name write: %d", rc);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+            value.pop_back();
+        }
+        if (!IsValidCustomName(value)) {
+            ESP_LOGW(TAG, "Rejected custom device name len=%u", len);
+            return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        }
+        const std::string full = std::string(CONFIG_BLE_RELAY_DEVICE_NAME_PREFIX) + "-" + value;
+        {
+            std::lock_guard<std::mutex> lock(relay.mutex_);
+            relay.custom_name_ = value;
+            Settings settings(kConnectivityNamespace, true);
+            settings.SetString(kBleCustomNameKey, value);
+            ble_svc_gap_device_name_set(full.c_str());
+            // 传统广播包在连接存续期间不能重启；断连路径会用新名字重建扫描响应。
+            if (relay.conn_handle_ == 0xFFFF) {
+                relay.RestartAdvertisingLocked();
+            } else {
+                ESP_LOGI(TAG, "Custom name saved; advertisement updates after disconnect");
+            }
+        }
+        ESP_LOGI(TAG, "Device renamed to %s", full.c_str());
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
 }
 
 void BleRelayManager::GattRegister(ble_gatt_register_ctxt* ctxt, void* arg) {

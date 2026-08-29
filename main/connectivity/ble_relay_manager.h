@@ -126,6 +126,7 @@ private:
     static void OnReset(int reason);
     static int GattAccessNotify(uint16_t conn_handle, uint16_t attr_handle, ble_gatt_access_ctxt* ctxt, void* arg);
     static int GattAccessWrite(uint16_t conn_handle, uint16_t attr_handle, ble_gatt_access_ctxt* ctxt, void* arg);
+    static int GattAccessDeviceName(uint16_t conn_handle, uint16_t attr_handle, ble_gatt_access_ctxt* ctxt, void* arg);
     static void GattRegister(ble_gatt_register_ctxt* ctxt, void* arg);
     static void HeartbeatTimer(void* arg);
     static BleRelayManager* instance_;
@@ -162,6 +163,7 @@ private:
     std::string pair_code_;
     std::string peer_id_;
     std::string secret_;
+    std::string custom_name_;
     std::string pending_pair_peer_id_;
     std::string pending_pair_secret_;
     std::string pending_pair_receipt_id_;
@@ -210,6 +212,7 @@ private:
     static ble_uuid128_t service_uuid_;
     static ble_uuid128_t app_to_device_uuid_;
     static ble_uuid128_t device_to_app_uuid_;
+    static ble_uuid128_t device_name_uuid_;
 };
 
 #endif
