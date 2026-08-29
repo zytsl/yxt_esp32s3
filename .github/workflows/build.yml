@@ -34,6 +34,8 @@ jobs:
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -I main tests/ble_relay_protocol_test.cc -o ble_relay_protocol_test
           ./ble_relay_protocol_test
+          g++ -std=c++17 -Wall -Wextra -Werror -I main tests/battery_curve_test.cc -o battery_curve_test
+          ./battery_curve_test
           python tests/verify_ble_security_profile.py
           python tests/verify_production_security.py
 

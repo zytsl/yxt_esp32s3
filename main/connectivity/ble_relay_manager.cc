@@ -1,6 +1,7 @@
 #include "ble_relay_manager.h"
 
 #include "application.h"
+#include "battery/battery_monitor.h"
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
@@ -2382,6 +2383,17 @@ int BleRelayManager::GattAccessDeviceName(uint16_t conn_handle, uint16_t attr_ha
         AddJsonString(root, "name", full);
         AddJsonString(root, "custom", custom);
         AddJsonString(root, "mac", SystemInfo::GetMacAddress());
+        // 电量增量字段：未配置电池 ADC 的板型自动省略，老 App 解析不受影响。
+        auto& battery = BatteryMonitor::GetInstance();
+        battery.EnsureStarted();
+        if (battery.IsEnabled() && battery.Millivolts() > 0) {
+            cJSON* bat = cJSON_CreateObject();
+            if (bat != nullptr) {
+                cJSON_AddNumberToObject(bat, "pct", battery.Percent());
+                cJSON_AddNumberToObject(bat, "mv", battery.Millivolts());
+                cJSON_AddItemToObject(root, "battery", bat);
+            }
+        }
         char* json = cJSON_PrintUnformatted(root);
         cJSON_Delete(root);
         if (json == nullptr) {

@@ -165,3 +165,20 @@ config BLE_RELAY_DEVICE_NAME_PREFIX
     help
         Prefix used for the BLE peripheral name shown to the mobile app.
 endmenu
+
+menu "Battery"
+
+config BATTERY_ADC_GPIO
+    int "Battery voltage ADC GPIO (ADC1 pins 1-10), -1 to disable"
+    default -1
+    help
+        GPIO that samples the battery through a resistor divider.
+        Core board v1 uses GPIO2 (ADC1_CH1) with a 100k/100k divider.
+
+config BATTERY_ADC_DIVIDER_PCT
+    int "Divider ratio times 100"
+    default 200
+    help
+        (R_top + R_bottom) / R_bottom, times 100. 100k/100k -> 200.
+
+endmenu
